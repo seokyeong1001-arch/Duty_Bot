@@ -128,6 +128,12 @@ app.command('/당번변경', async ({ command, ack, respond }) => {
   });
 });
 
+// ─── /당번주간 : 나에게만 보이는 이번 주 일정 ──────────
+app.command("/당번주간", async ({ ack, respond }) => {
+  await ack();
+  await respond({ text: weeklyMessage(todayStr()), response_type: "ephemeral" });
+});
+
 // ─── /당번요청 ────────────────────────────────────────
 // 하루 전체: /당번요청 05.20
 // 시간대 지정: /당번요청 05.20 오후
