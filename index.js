@@ -8,7 +8,7 @@ const app = new App({
 
 // ─── 설정 (여기만 수정) ───────────────────────────────
 const CONFIG = {
-  members: ['김민준', '이서윤', '박지호'], // 순환 순서
+  members: ['문선정', '고가영', '이석영'], // 순환 순서
   startDate: '2025-05-17',                 // 첫 번째 멤버 당번 시작일 (오전 기준)
   notifyChannel: process.env.SLACK_CHANNEL,
 
