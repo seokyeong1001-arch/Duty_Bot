@@ -8,221 +8,232 @@ const app = new App({
 
 // ─── 설정 (여기만 수정) ───────────────────────────────
 const CONFIG = {
-  members: ['문선정', '고가영', '이석영'], // 순환 순서
-  startDate: '2025-05-17',                 // 첫 번째 멤버 당번 시작일 (오전 기준)
+  members: ['문선정', '고가영', '이석영'],
+  startDate: '2026-01-01',
   notifyChannel: process.env.SLACK_CHANNEL,
-
-  // 슬롯 정의: key는 내부 식별자, label은 표시 이름, cron은 알림 시각
-  slots: [
-    { key: 'am', label: '오전', cron: '30 7 * * *' },
-    { key: 'pm', label: '오후', cron: '0 13 * * *' },
-  ],
+  notifyTime: '30 7 * * *',     // 매일 07:30 당번 알림
+  weeklyTime: '30 7 * * 1',    // 매주 월요일 07:30 주간 일정
 };
 // ─────────────────────────────────────────────────────
 
-// 시간대별 수동 변경 저장소
-// { 'YYYY-MM-DD:am': '이름', 'YYYY-MM-DD:pm': '이름' }
 const overrides = {};
 
-// 슬롯 key 목록
-const slotKeys = CONFIG.slots.map(s => s.key);
-
-// 날짜+슬롯 기준으로 순환 인덱스 계산
-function getDutyMember(dateStr, slotKey) {
-  const overrideKey = `${dateStr}:${slotKey}`;
-  if (overrides[overrideKey]) return overrides[overrideKey];
-
+function getDutyMember(dateStr) {
+  if (overrides[dateStr]) return overrides[dateStr];
   const start = new Date(CONFIG.startDate);
   const target = new Date(dateStr);
-  const dayDiff = Math.round((target - start) / (1000 * 60 * 60 * 24));
-  if (dayDiff < 0) return null;
-
-  const slotIdx = slotKeys.indexOf(slotKey);
-  const totalSlotIdx = dayDiff * slotKeys.length + slotIdx;
-  return CONFIG.members[totalSlotIdx % CONFIG.members.length];
+  const diff = Math.round((target - start) / (1000 * 60 * 60 * 24));
+  if (diff < 0) return null;
+  return CONFIG.members[diff % CONFIG.members.length];
 }
 
 function todayStr() {
   return new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Seoul' });
 }
 
-function currentSlotKey() {
-  const hour = parseInt(
-    new Date().toLocaleTimeString('ko-KR', { timeZone: 'Asia/Seoul', hour: '2-digit', hour12: false }),
-    10
-  );
-  return hour >= 13 ? 'pm' : 'am';
-}
-
-function slotLabel(slotKey) {
-  return CONFIG.slots.find(s => s.key === slotKey)?.label || slotKey;
-}
-
-function dutyMessage(dateStr, slotKey) {
-  const member = getDutyMember(dateStr, slotKey);
+function dateLabel(dateStr) {
   const d = new Date(dateStr);
   const dayNames = ['일', '월', '화', '수', '목', '금', '토'];
-  const day = dayNames[d.getDay()];
   const [, mm, dd] = dateStr.split('-');
-  const label = slotLabel(slotKey);
+  return `${mm}/${dd} (${dayNames[d.getDay()]})`;
+}
+
+function dutyMessage(dateStr) {
+  const amOv = overrides[`${dateStr}:오전`];
+  const pmOv = overrides[`${dateStr}:오후`];
+  const label = dateLabel(dateStr);
+
+  if (amOv || pmOv) {
+    const base = getDutyMember(dateStr);
+    const am = amOv || base;
+    const pm = pmOv || base;
+    return `🔔 *[당번 알림]* ${label}\n\n오전: *${am}* 님  |  오후: *${pm}* 님\n수고해주세요 💪`;
+  }
+
+  const member = getDutyMember(dateStr);
   return member
-    ? `🔔 *[당번 알림]* ${mm}/${dd} (${day}) ${label}\n\n${label} 당번은 *${member}* 님입니다! 수고해주세요 💪`
+    ? `🔔 *[당번 알림]* ${label}\n\n오늘 당번은 *${member}* 님입니다! 수고해주세요 💪`
     : `⚠️ 당번 정보를 불러올 수 없어요.`;
 }
 
-// ─── /당번 : 현재 시간대 당번 확인 ───────────────────
-app.command('/당번', async ({ ack, respond }) => {
-  await ack();
-  const today = todayStr();
-  const slot = currentSlotKey();
-  await respond({ text: dutyMessage(today, slot), response_type: 'in_channel' });
-});
-
-// ─── /당번순서 : 전체 순환 순서 확인 ─────────────────
-app.command('/당번순서', async ({ ack, respond }) => {
-  await ack();
-  const today = todayStr();
-  const slot = currentSlotKey();
-  const currentMember = getDutyMember(today, slot);
-  const lines = CONFIG.members.map((m, i) => {
-    const marker = m === currentMember ? ' ← 지금' : '';
-    return `${i + 1}. ${m}${marker}`;
-  });
-  await respond({
-    text: `📋 *당번 순환 순서*\n${lines.join('\n')}`,
-    response_type: 'ephemeral',
-  });
-});
+function weeklyMessage(fromDateStr) {
+  const dayNames = ['일', '월', '화', '수', '목', '금', '토'];
+  const lines = [];
+  for (let i = 0; i < 7; i++) {
+    const d = new Date(fromDateStr);
+    d.setDate(d.getDate() + i);
+    const ds = d.toLocaleDateString('sv-SE');
+    const [, mm, dd] = ds.split('-');
+    const day = dayNames[d.getDay()];
+    const amOv = overrides[`${ds}:오전`];
+    const pmOv = overrides[`${ds}:오후`];
+    const base = overrides[ds] || getDutyMember(ds) || '—';
+    let line;
+    if (amOv || pmOv) {
+      line = `• ${mm}/${dd} (${day})\n  오전: ${amOv ? `${amOv} _(변경)_` : base}  |  오후: ${pmOv ? `${pmOv} _(변경)_` : base}`;
+    } else {
+      line = `• ${mm}/${dd} (${day})  ${base}${overrides[ds] ? ' _(변경)_' : ''}`;
+    }
+    lines.push(line);
+  }
+  return `📅 *이번 주 당번 일정*\n${lines.join('\n')}`;
+}
 
 // ─── /당번변경 ────────────────────────────────────────
-// 시간대 지정: /당번변경 2025-05-20 오후 이서윤
-// 하루 전체:   /당번변경 2025-05-20 이서윤
+// 하루 전체: /당번변경 2026-05-20 고가영
+// 시간대 지정: /당번변경 2026-05-20 오후 고가영
 app.command('/당번변경', async ({ command, ack, respond }) => {
   await ack();
   const parts = command.text.trim().split(/\s+/);
 
   if (parts.length === 3) {
-    const [date, slotLabelInput, name] = parts;
+    const [date, slot, name] = parts;
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-      await respond({ text: '❌ 날짜 형식: `YYYY-MM-DD`', response_type: 'ephemeral' });
-      return;
+      await respond({ text: '❌ 날짜 형식: `YYYY-MM-DD`', response_type: 'ephemeral' }); return;
     }
-    const slot = CONFIG.slots.find(s => s.label === slotLabelInput);
-    if (!slot) {
-      const labels = CONFIG.slots.map(s => s.label).join('|');
-      await respond({ text: `❌ 시간대는 \`${labels}\` 중 하나로 입력해주세요.`, response_type: 'ephemeral' });
-      return;
+    if (slot !== '오전' && slot !== '오후') {
+      await respond({ text: '❌ 시간대는 `오전` 또는 `오후`로 입력해주세요.', response_type: 'ephemeral' }); return;
     }
-    overrides[`${date}:${slot.key}`] = name;
-    await respond({
-      text: `✅ *${date} ${slot.label}* 당번을 *${name}* 님으로 변경했어요.`,
-      response_type: 'in_channel',
-    });
+    overrides[`${date}:${slot}`] = name;
+    await respond({ text: `✅ *${dateLabel(date)} ${slot}* 당번을 *${name}* 님으로 변경했어요.`, response_type: 'in_channel' });
     return;
   }
 
   if (parts.length === 2) {
     const [date, name] = parts;
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-      await respond({ text: '❌ 날짜 형식: `YYYY-MM-DD`', response_type: 'ephemeral' });
-      return;
+      await respond({ text: '❌ 날짜 형식: `YYYY-MM-DD`', response_type: 'ephemeral' }); return;
     }
-    CONFIG.slots.forEach(s => { overrides[`${date}:${s.key}`] = name; });
-    await respond({
-      text: `✅ *${date}* 하루 전체 당번을 *${name}* 님으로 변경했어요.`,
-      response_type: 'in_channel',
-    });
+    overrides[date] = name;
+    await respond({ text: `✅ *${dateLabel(date)}* 당번을 *${name}* 님으로 변경했어요.`, response_type: 'in_channel' });
     return;
   }
 
   await respond({
-    text: '❌ 사용법:\n• 시간대 지정: `/당번변경 2025-05-20 오후 이서윤`\n• 하루 전체: `/당번변경 2025-05-20 이서윤`',
+    text: '❌ 사용법:\n• 하루 전체: `/당번변경 2026-05-20 고가영`\n• 시간대 지정: `/당번변경 2026-05-20 오후 고가영`',
     response_type: 'ephemeral',
   });
 });
 
-// ─── /당번취소 ────────────────────────────────────────
-// 시간대 지정: /당번취소 2025-05-20 오후
-// 하루 전체:   /당번취소 2025-05-20
-app.command('/당번취소', async ({ command, ack, respond }) => {
+// ─── /당번요청 ────────────────────────────────────────
+// 하루 전체: /당번요청 2026-05-20
+// 시간대 지정: /당번요청 2026-05-20 오후
+app.command('/당번요청', async ({ command, ack, client, respond }) => {
   await ack();
   const parts = command.text.trim().split(/\s+/);
   const date = parts[0];
+  const slot = parts[1] || null;
 
   if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-    await respond({ text: '❌ 날짜 형식: `YYYY-MM-DD`', response_type: 'ephemeral' });
-    return;
+    await respond({ text: '❌ 사용법:\n• 하루 전체: `/당번요청 2026-05-20`\n• 시간대 지정: `/당번요청 2026-05-20 오후`', response_type: 'ephemeral' }); return;
+  }
+  if (slot && slot !== '오전' && slot !== '오후') {
+    await respond({ text: '❌ 시간대는 `오전` 또는 `오후`로 입력해주세요.', response_type: 'ephemeral' }); return;
   }
 
-  if (parts.length === 2) {
-    const slot = CONFIG.slots.find(s => s.label === parts[1]);
-    if (!slot) {
-      const labels = CONFIG.slots.map(s => s.label).join('|');
-      await respond({ text: `❌ 시간대는 \`${labels}\` 중 하나로 입력해주세요.`, response_type: 'ephemeral' });
-      return;
-    }
-    const key = `${date}:${slot.key}`;
-    if (overrides[key]) {
-      delete overrides[key];
-      await respond({ text: `↩️ *${date} ${slot.label}* 변경을 취소했어요.`, response_type: 'in_channel' });
-    } else {
-      await respond({ text: `ℹ️ *${date} ${slot.label}*에 수동 변경된 당번이 없어요.`, response_type: 'ephemeral' });
-    }
-    return;
-  }
+  const slotText = slot ? ` ${slot}` : '';
+  const requester = command.user_name;
+  const label = dateLabel(date);
+  const actionValue = JSON.stringify({ date, slot: slot || null, requester });
 
-  const removed = CONFIG.slots.filter(s => {
-    const key = `${date}:${s.key}`;
-    if (overrides[key]) { delete overrides[key]; return true; }
-    return false;
+  await client.chat.postMessage({
+    channel: CONFIG.notifyChannel,
+    text: `🙏 당번 교체 요청`,
+    blocks: [
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: `🙏 *당번 교체 요청*\n\n*${label}${slotText}* 당번을 대신 해주실 분 있으신가요?\n요청자: *${requester}* 님`,
+        },
+      },
+      {
+        type: 'actions',
+        elements: [
+          {
+            type: 'button',
+            text: { type: 'plain_text', text: '✅ 수락' },
+            style: 'primary',
+            action_id: 'duty_accept',
+            value: actionValue,
+          },
+          {
+            type: 'button',
+            text: { type: 'plain_text', text: '❌ 거절' },
+            style: 'danger',
+            action_id: 'duty_decline',
+            value: actionValue,
+          },
+        ],
+      },
+    ],
   });
-  if (removed.length > 0) {
-    await respond({ text: `↩️ *${date}* 전체 변경을 취소했어요.`, response_type: 'in_channel' });
-  } else {
-    await respond({ text: `ℹ️ *${date}*에 수동 변경된 당번이 없어요.`, response_type: 'ephemeral' });
-  }
+
+  await respond({ text: `📨 *${label}${slotText}* 교체 요청을 채널에 보냈어요.`, response_type: 'ephemeral' });
 });
 
-// ─── /당번주간 : 이번 주 당번 미리보기 ───────────────
-app.command('/당번주간', async ({ ack, respond }) => {
+// ─── 수락 버튼 처리 ───────────────────────────────────
+app.action('duty_accept', async ({ body, ack, client }) => {
   await ack();
-  const today = todayStr();
-  const dayNames = ['일', '월', '화', '수', '목', '금', '토'];
-  const lines = [];
+  const { date, slot, requester } = JSON.parse(body.actions[0].value);
+  const acceptor = body.user.username;
+  const label = dateLabel(date);
+  const slotText = slot ? ` ${slot}` : '';
 
-  for (let i = 0; i < 7; i++) {
-    const d = new Date(today);
-    d.setDate(d.getDate() + i);
-    const ds = d.toLocaleDateString('sv-SE');
-    const [, mm, dd] = ds.split('-');
-    const day = dayNames[d.getDay()];
-    const isToday = ds === today ? ' *← 오늘*' : '';
-
-    const slotParts = CONFIG.slots.map(s => {
-      const member = getDutyMember(ds, s.key) || '—';
-      const isOverride = overrides[`${ds}:${s.key}`] ? '_(변경)_' : '';
-      return `${s.label}: ${member} ${isOverride}`.trim();
-    });
-
-    lines.push(`• ${mm}/${dd} (${day})${isToday}\n  ${slotParts.join('  |  ')}`);
+  if (slot) {
+    overrides[`${date}:${slot}`] = acceptor;
+  } else {
+    overrides[date] = acceptor;
   }
 
-  await respond({
-    text: `📅 *이번 주 당번 일정*\n${lines.join('\n')}`,
-    response_type: 'ephemeral',
+  await client.chat.update({
+    channel: body.channel.id,
+    ts: body.message.ts,
+    text: `✅ 당번 교체 완료`,
+    blocks: [
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: `✅ *당번 교체 완료*\n\n*${label}${slotText}* 당번이 *${acceptor}* 님으로 변경됐어요!\n요청자: ${requester} 님 → 수락: *${acceptor}* 님 🎉`,
+        },
+      },
+    ],
   });
 });
 
-// ─── 슬롯별 자동 알림 스케줄 ─────────────────────────
-CONFIG.slots.forEach(slot => {
-  cron.schedule(slot.cron, async () => {
-    const today = todayStr();
-    await app.client.chat.postMessage({
-      channel: CONFIG.notifyChannel,
-      text: dutyMessage(today, slot.key),
-    });
-  }, { timezone: 'Asia/Seoul' });
+// ─── 거절 버튼 처리 ───────────────────────────────────
+app.action('duty_decline', async ({ body, ack, client }) => {
+  await ack();
+  const { date, slot, requester } = JSON.parse(body.actions[0].value);
+  const decliner = body.user.username;
+  const label = dateLabel(date);
+  const slotText = slot ? ` ${slot}` : '';
+
+  await client.chat.postMessage({
+    channel: body.channel.id,
+    thread_ts: body.message.ts,
+    text: `*${decliner}* 님이 *${label}${slotText}* 교체 요청을 거절했어요.`,
+  });
 });
+
+// ─── 매일 07:30 당번 알림 ────────────────────────────
+cron.schedule(CONFIG.notifyTime, async () => {
+  const today = todayStr();
+  await app.client.chat.postMessage({
+    channel: CONFIG.notifyChannel,
+    text: dutyMessage(today),
+  });
+}, { timezone: 'Asia/Seoul' });
+
+// ─── 매주 월요일 07:30 주간 일정 알림 ────────────────
+cron.schedule(CONFIG.weeklyTime, async () => {
+  const today = todayStr();
+  await app.client.chat.postMessage({
+    channel: CONFIG.notifyChannel,
+    text: weeklyMessage(today),
+  });
+}, { timezone: 'Asia/Seoul' });
 
 // ─── 서버 시작 ────────────────────────────────────────
 (async () => {
