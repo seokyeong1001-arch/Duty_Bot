@@ -11,12 +11,23 @@ const CONFIG = {
   members: ['문선정', '고가영', '이석영'],
   startDate: '2026-01-01',
   notifyChannel: process.env.SLACK_CHANNEL,
-  notifyTime: '30 7 * * *',     // 매일 07:30 당번 알림
-  weeklyTime: '30 7 * * 1',    // 매주 월요일 07:30 주간 일정
+  notifyTime: '30 7 * * *',
+  weeklyTime: '30 7 * * 1',
 };
 // ─────────────────────────────────────────────────────
 
 const overrides = {};
+
+// "05.20" → "2026-05-20" 변환 (현재 연도 자동 적용)
+function parseDate(input) {
+  const today = new Date();
+  const year = today.toLocaleDateString('sv-SE', { timeZone: 'Asia/Seoul' }).slice(0, 4);
+  const match = input.match(/^(\d{1,2})\.(\d{1,2})$/);
+  if (!match) return null;
+  const mm = match[1].padStart(2, '0');
+  const dd = match[2].padStart(2, '0');
+  return `${year}-${mm}-${dd}`;
+}
 
 function getDutyMember(dateStr) {
   if (overrides[dateStr]) return overrides[dateStr];
@@ -80,16 +91,17 @@ function weeklyMessage(fromDateStr) {
 }
 
 // ─── /당번변경 ────────────────────────────────────────
-// 하루 전체: /당번변경 2026-05-20 고가영
-// 시간대 지정: /당번변경 2026-05-20 오후 고가영
+// 하루 전체: /당번변경 05.20 고가영
+// 시간대 지정: /당번변경 05.20 오후 고가영
 app.command('/당번변경', async ({ command, ack, respond }) => {
   await ack();
   const parts = command.text.trim().split(/\s+/);
 
   if (parts.length === 3) {
-    const [date, slot, name] = parts;
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-      await respond({ text: '❌ 날짜 형식: `YYYY-MM-DD`', response_type: 'ephemeral' }); return;
+    const [rawDate, slot, name] = parts;
+    const date = parseDate(rawDate);
+    if (!date) {
+      await respond({ text: '❌ 날짜 형식: `05.20`', response_type: 'ephemeral' }); return;
     }
     if (slot !== '오전' && slot !== '오후') {
       await respond({ text: '❌ 시간대는 `오전` 또는 `오후`로 입력해주세요.', response_type: 'ephemeral' }); return;
@@ -100,9 +112,10 @@ app.command('/당번변경', async ({ command, ack, respond }) => {
   }
 
   if (parts.length === 2) {
-    const [date, name] = parts;
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-      await respond({ text: '❌ 날짜 형식: `YYYY-MM-DD`', response_type: 'ephemeral' }); return;
+    const [rawDate, name] = parts;
+    const date = parseDate(rawDate);
+    if (!date) {
+      await respond({ text: '❌ 날짜 형식: `05.20`', response_type: 'ephemeral' }); return;
     }
     overrides[date] = name;
     await respond({ text: `✅ *${dateLabel(date)}* 당번을 *${name}* 님으로 변경했어요.`, response_type: 'in_channel' });
@@ -110,22 +123,23 @@ app.command('/당번변경', async ({ command, ack, respond }) => {
   }
 
   await respond({
-    text: '❌ 사용법:\n• 하루 전체: `/당번변경 2026-05-20 고가영`\n• 시간대 지정: `/당번변경 2026-05-20 오후 고가영`',
+    text: '❌ 사용법:\n• 하루 전체: `/당번변경 05.20 고가영`\n• 시간대 지정: `/당번변경 05.20 오후 고가영`',
     response_type: 'ephemeral',
   });
 });
 
 // ─── /당번요청 ────────────────────────────────────────
-// 하루 전체: /당번요청 2026-05-20
-// 시간대 지정: /당번요청 2026-05-20 오후
+// 하루 전체: /당번요청 05.20
+// 시간대 지정: /당번요청 05.20 오후
 app.command('/당번요청', async ({ command, ack, client, respond }) => {
   await ack();
   const parts = command.text.trim().split(/\s+/);
-  const date = parts[0];
+  const rawDate = parts[0];
   const slot = parts[1] || null;
 
-  if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-    await respond({ text: '❌ 사용법:\n• 하루 전체: `/당번요청 2026-05-20`\n• 시간대 지정: `/당번요청 2026-05-20 오후`', response_type: 'ephemeral' }); return;
+  const date = parseDate(rawDate);
+  if (!date) {
+    await respond({ text: '❌ 사용법:\n• 하루 전체: `/당번요청 05.20`\n• 시간대 지정: `/당번요청 05.20 오후`', response_type: 'ephemeral' }); return;
   }
   if (slot && slot !== '오전' && slot !== '오후') {
     await respond({ text: '❌ 시간대는 `오전` 또는 `오후`로 입력해주세요.', response_type: 'ephemeral' }); return;
@@ -195,7 +209,7 @@ app.action('duty_accept', async ({ body, ack, client }) => {
         type: 'section',
         text: {
           type: 'mrkdwn',
-          text: `✅ *당번 교체 완료*\n\n*${label}${slotText}* 당번이 *${acceptor}* 님으로 변경됐어요!\n요청자: ${requester} 님 → 수락: *${acceptor}* 님 🎉`,
+          text: `✅ *당번 교체 완료*\n\n*${label}${slotText}* 당번이 *${acceptor}* 님으로 변경됐어요!\n${requester} 님 → *${acceptor}* 님 🎉`,
         },
       },
     ],
@@ -219,19 +233,17 @@ app.action('duty_decline', async ({ body, ack, client }) => {
 
 // ─── 매일 07:30 당번 알림 ────────────────────────────
 cron.schedule(CONFIG.notifyTime, async () => {
-  const today = todayStr();
   await app.client.chat.postMessage({
     channel: CONFIG.notifyChannel,
-    text: dutyMessage(today),
+    text: dutyMessage(todayStr()),
   });
 }, { timezone: 'Asia/Seoul' });
 
-// ─── 매주 월요일 07:30 주간 일정 알림 ────────────────
+// ─── 매주 월요일 07:30 주간 일정 ─────────────────────
 cron.schedule(CONFIG.weeklyTime, async () => {
-  const today = todayStr();
   await app.client.chat.postMessage({
     channel: CONFIG.notifyChannel,
-    text: weeklyMessage(today),
+    text: weeklyMessage(todayStr()),
   });
 }, { timezone: 'Asia/Seoul' });
 
