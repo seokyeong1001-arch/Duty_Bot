@@ -29,6 +29,15 @@ function parseDate(input) {
   return `${year}-${mm}-${dd}`;
 }
 
+async function getRealName(client, userId) {
+  try {
+    const res = await client.users.info({ user: userId });
+    return res.user.profile.display_name || res.user.profile.real_name || res.user.name;
+  } catch {
+    return userId;
+  }
+}
+
 function getDutyMember(dateStr) {
   if (overrides[dateStr]) return overrides[dateStr];
   const start = new Date(CONFIG.startDate);
@@ -89,6 +98,43 @@ function weeklyMessage(fromDateStr) {
   }
   return `📅 *이번 주 당번 일정*\n${lines.join('\n')}`;
 }
+
+// ─── /당번취소 ────────────────────────────────────────
+// 하루 전체: /당번취소 05.20
+// 시간대 지정: /당번취소 05.20 오전
+app.command('/당번취소', async ({ command, ack, respond }) => {
+  await ack();
+  const parts = command.text.trim().split(/\s+/);
+  const rawDate = parts[0];
+  const slot = parts[1] || null;
+
+  const date = parseDate(rawDate);
+  if (!date) {
+    await respond({ text: '❌ 날짜 형식: `05.20`', response_type: 'ephemeral' }); return;
+  }
+  if (slot && slot !== '오전' && slot !== '오후') {
+    await respond({ text: '❌ 시간대는 `오전` 또는 `오후`로 입력해주세요.', response_type: 'ephemeral' }); return;
+  }
+
+  if (slot) {
+    const key = `${date}:${slot}`;
+    if (overrides[key]) {
+      delete overrides[key];
+      await respond({ text: `↩️ *${dateLabel(date)} ${slot}* 변경을 취소했어요.`, response_type: 'in_channel' });
+    } else {
+      await respond({ text: `ℹ️ *${dateLabel(date)} ${slot}*에 수동 변경된 당번이 없어요.`, response_type: 'ephemeral' });
+    }
+    return;
+  }
+
+  const removed = [];
+  [date, `${date}:오전`, `${date}:오후`].forEach(k => { if (overrides[k]) { delete overrides[k]; removed.push(k); } });
+  if (removed.length > 0) {
+    await respond({ text: `↩️ *${dateLabel(date)}* 당번 변경을 취소했어요.`, response_type: 'in_channel' });
+  } else {
+    await respond({ text: `ℹ️ *${dateLabel(date)}*에 수동 변경된 당번이 없어요.`, response_type: 'ephemeral' });
+  }
+});
 
 // ─── /당번변경 ────────────────────────────────────────
 // 하루 전체: /당번변경 05.20 고가영
@@ -152,7 +198,7 @@ app.command('/당번요청', async ({ command, ack, client, respond }) => {
   }
 
   const slotText = slot ? ` ${slot}` : '';
-  const requester = command.user_name;
+  const requester = await getRealName(client, command.user_id);
   const label = dateLabel(date);
   const actionValue = JSON.stringify({ date, slot: slot || null, requester });
 
@@ -196,7 +242,7 @@ app.command('/당번요청', async ({ command, ack, client, respond }) => {
 app.action('duty_accept', async ({ body, ack, client }) => {
   await ack();
   const { date, slot, requester } = JSON.parse(body.actions[0].value);
-  const acceptor = body.user.username;
+  const acceptor = await getRealName(app.client, body.user.id);
   const label = dateLabel(date);
   const slotText = slot ? ` ${slot}` : '';
 
@@ -226,7 +272,7 @@ app.action('duty_accept', async ({ body, ack, client }) => {
 app.action('duty_decline', async ({ body, ack, client }) => {
   await ack();
   const { date, slot, requester } = JSON.parse(body.actions[0].value);
-  const decliner = body.user.username;
+  const decliner = await getRealName(app.client, body.user.id);
   const label = dateLabel(date);
   const slotText = slot ? ` ${slot}` : '';
 
