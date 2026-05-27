@@ -8,22 +8,34 @@ const app = new App({
 
 // ─── 설정 (여기만 수정) ───────────────────────────────
 const CONFIG = {
-  members: ['문선정', '고가영', '이석영'],
-  startDate: '2026-01-01',
+  startDate: '2026-06-01', // 가영/선정이 첫날 당번
   notifyChannel: process.env.SLACK_CHANNEL,
   notifyTime: '30 7 * * *',
   weeklyTime: '30 7 * * 1',
   eveningNotifyTime: '0 18 * * *',
-  // 태그용 유저 ID (이름 순서와 동일하게)
+
+  // 파인트 루프: 가영 ↔ 지연 하루씩 교대
+  pint: ['고가영', '지연'],
+  // 스틱바 루프: 선정 ↔ 유진 하루씩 교대
+  stick: ['문선정', '유진'],
+
+  // 크첵 패턴 (지연/유진 당번날에만 붙음)
+  // 파인트 크첵: 석영 → 가영 → 석영 → 가영 ...
+  pintCheck: ['이석영', '고가영'],
+  // 스틱바 크첵: 선정 → 석영 → 선정 → 석영 ...
+  stickCheck: ['문선정', '이석영'],
+
   memberIds: {
-    '문선정': 'U07N2D1DYE6',
     '고가영': 'U0A4DMQ1D99',
+    '지연': 'U0AMT81HV42',
+    '문선정': 'U07N2D1DYE6',
+    '유진': 'U0AMPR3Q09K',
     '이석영': 'U06TTAA85TQ',
   },
 };
 // ─────────────────────────────────────────────────────
 
-const overrides = {};
+const overrides = {}; // { 'YYYY-MM-DD:pint': '이름', 'YYYY-MM-DD:stick': '이름' }
 let weeklyThreadTs = null;
 
 function getWeekLabel(dateStr) {
@@ -53,16 +65,45 @@ async function getRealName(client, userId) {
   }
 }
 
-function getDutyMember(dateStr) {
-  if (overrides[dateStr]) return overrides[dateStr];
+function dayDiff(dateStr) {
   const start = new Date(CONFIG.startDate);
   const target = new Date(dateStr);
-  const diff = Math.round((target - start) / (1000 * 60 * 60 * 24));
-  if (diff < 0) return null;
-  return CONFIG.members[diff % CONFIG.members.length];
+  return Math.round((target - start) / (1000 * 60 * 60 * 24));
 }
 
-// 이름 → 슬랙 멘션 태그
+// 파인트 당번 (가영=짝수일, 지연=홀수일)
+function getPintMain(dateStr) {
+  if (overrides[`${dateStr}:pint`]) return overrides[`${dateStr}:pint`];
+  const diff = dayDiff(dateStr);
+  return diff < 0 ? null : CONFIG.pint[diff % 2];
+}
+
+// 스틱바 당번 (선정=짝수일, 유진=홀수일)
+function getStickMain(dateStr) {
+  if (overrides[`${dateStr}:stick`]) return overrides[`${dateStr}:stick`];
+  const diff = dayDiff(dateStr);
+  return diff < 0 ? null : CONFIG.stick[diff % 2];
+}
+
+// 파인트 크첵 (지연 당번날에만, 석영→가영→석영→가영...)
+// 지연 당번날 = 홀수일, 크첵 순번은 홀수일 중 몇 번째인지로 계산
+function getPintCheck(dateStr) {
+  if (overrides[`${dateStr}:pintCheck`]) return overrides[`${dateStr}:pintCheck`];
+  const diff = dayDiff(dateStr);
+  if (diff < 0 || diff % 2 === 0) return null; // 가영 당번날은 크첵 없음
+  const checkIdx = Math.floor(diff / 2); // 지연 당번 횟수
+  return CONFIG.pintCheck[checkIdx % CONFIG.pintCheck.length];
+}
+
+// 스틱바 크첵 (유진 당번날에만, 선정→석영→선정→석영...)
+function getStickCheck(dateStr) {
+  if (overrides[`${dateStr}:stickCheck`]) return overrides[`${dateStr}:stickCheck`];
+  const diff = dayDiff(dateStr);
+  if (diff < 0 || diff % 2 === 0) return null; // 선정 당번날은 크첵 없음
+  const checkIdx = Math.floor(diff / 2);
+  return CONFIG.stickCheck[checkIdx % CONFIG.stickCheck.length];
+}
+
 function mentionTag(name) {
   const id = CONFIG.memberIds[name];
   return id ? `<@${id}>` : `*${name}*`;
@@ -79,56 +120,35 @@ function dateLabel(dateStr) {
   return `${mm}/${dd} (${dayNames[d.getDay()]})`;
 }
 
-// 스레드 없으면 새로 만들고 ts 저장
-async function ensureWeeklyThread() {
-  if (weeklyThreadTs) return;
-  const today = todayStr();
-  const weekLabel = getWeekLabel(today);
-  const res = await app.client.chat.postMessage({
-    channel: CONFIG.notifyChannel,
-    text: `📅 *${weekLabel} 당번 일정*\n\n${weeklyMessage(today)}`,
-  });
-  weeklyThreadTs = res.ts;
+function formatDutyLine(main, check, withTag) {
+  const mainText = withTag ? mentionTag(main) : `*${main}*`;
+  if (check) {
+    const checkText = withTag ? mentionTag(check) : `*${check}*`;
+    return `${mainText} + ${checkText} (크첵)`;
+  }
+  return mainText;
 }
 
 function dutyMessage(dateStr, withTag = false) {
-  const amOv = overrides[`${dateStr}:오전`];
-  const pmOv = overrides[`${dateStr}:오후`];
   const label = dateLabel(dateStr);
-  if (amOv || pmOv) {
-    const base = getDutyMember(dateStr);
-    const am = amOv || base;
-    const pm = pmOv || base;
-    const amText = withTag ? mentionTag(am) : `*${am}*`;
-    const pmText = withTag ? mentionTag(pm) : `*${pm}*`;
-    return `🔔 *[당번 알림]* ${label}\n\n오전: ${amText} 님  |  오후: ${pmText} 님\n수고해주세요 💪`;
-  }
-  const member = getDutyMember(dateStr);
-  if (!member) return `⚠️ 당번 정보를 불러올 수 없어요.`;
-  const memberText = withTag ? mentionTag(member) : `*${member}*`;
-  return `🔔 *[당번 알림]* ${label}\n\n오늘 당번은 ${memberText} 님입니다! 수고해주세요 💪`;
+  const pintMain = getPintMain(dateStr);
+  const stickMain = getStickMain(dateStr);
+  const pintCheck = getPintCheck(dateStr);
+  const stickCheck = getStickCheck(dateStr);
+  const pintLine = pintMain ? formatDutyLine(pintMain, pintCheck, withTag) : '—';
+  const stickLine = stickMain ? formatDutyLine(stickMain, stickCheck, withTag) : '—';
+  return `🔔 *[당번 알림]* ${label}\n\n📍 파인트: ${pintLine}\n📍 스틱바: ${stickLine}\n\n수고해주세요 💪`;
 }
 
 function eveningMessage(tomorrowStr, withTag = false) {
-  const amOv = overrides[`${tomorrowStr}:오전`];
-  const pmOv = overrides[`${tomorrowStr}:오후`];
-  const d = new Date(tomorrowStr);
-  const dayNames = ['일', '월', '화', '수', '목', '금', '토'];
-  const [, mm, dd] = tomorrowStr.split('-');
-  const day = dayNames[d.getDay()];
-  let memberText;
-  if (amOv || pmOv) {
-    const base = getDutyMember(tomorrowStr);
-    const am = amOv || base;
-    const pm = pmOv || base;
-    const amText = withTag ? mentionTag(am) : `*${am}*`;
-    const pmText = withTag ? mentionTag(pm) : `*${pm}*`;
-    memberText = `오전: ${amText} 님  |  오후: ${pmText} 님`;
-  } else {
-    const m = getDutyMember(tomorrowStr);
-    memberText = m ? (withTag ? `${mentionTag(m)} 님` : `*${m}* 님`) : '—';
-  }
-  return `🌙 *[내일 당번 예고]* ${mm}/${dd} (${day})\n\n내일 당번은 ${memberText}입니다!`;
+  const label = dateLabel(tomorrowStr);
+  const pintMain = getPintMain(tomorrowStr);
+  const stickMain = getStickMain(tomorrowStr);
+  const pintCheck = getPintCheck(tomorrowStr);
+  const stickCheck = getStickCheck(tomorrowStr);
+  const pintLine = pintMain ? formatDutyLine(pintMain, pintCheck, withTag) : '—';
+  const stickLine = stickMain ? formatDutyLine(stickMain, stickCheck, withTag) : '—';
+  return `🌙 *[내일 당번 예고]* ${label}\n\n📍 파인트: ${pintLine}\n📍 스틱바: ${stickLine}`;
 }
 
 function weeklyMessage(fromDateStr) {
@@ -140,63 +160,78 @@ function weeklyMessage(fromDateStr) {
     const ds = d.toLocaleDateString('sv-SE');
     const [, mm, dd] = ds.split('-');
     const day = dayNames[d.getDay()];
-    const amOv = overrides[`${ds}:오전`];
-    const pmOv = overrides[`${ds}:오후`];
-    const base = overrides[ds] || getDutyMember(ds) || '—';
-    let line;
-    if (amOv || pmOv) {
-      line = `• ${mm}/${dd} (${day})\n  오전: ${amOv ? amOv + ' _(변경)_' : base}  |  오후: ${pmOv ? pmOv + ' _(변경)_' : base}`;
-    } else {
-      line = `• ${mm}/${dd} (${day})  ${base}${overrides[ds] ? ' _(변경)_' : ''}`;
-    }
-    lines.push(line);
+    const pintMain = getPintMain(ds) || '—';
+    const stickMain = getStickMain(ds) || '—';
+    const pintCheck = getPintCheck(ds);
+    const stickCheck = getStickCheck(ds);
+    const pintLine = pintCheck ? `${pintMain} + ${pintCheck}(크첵)` : pintMain;
+    const stickLine = stickCheck ? `${stickMain} + ${stickCheck}(크첵)` : stickMain;
+    lines.push(`• ${mm}/${dd} (${day})  파인트: ${pintLine}  |  스틱바: ${stickLine}`);
   }
   return lines.join('\n');
 }
+
+async function ensureWeeklyThread() {
+  if (weeklyThreadTs) return;
+  const today = todayStr();
+  const weekLabel = getWeekLabel(today);
+  const res = await app.client.chat.postMessage({
+    channel: CONFIG.notifyChannel,
+    text: `📅 *${weekLabel} 당번 일정*\n\n${weeklyMessage(today)}`,
+  });
+  weeklyThreadTs = res.ts;
+}
+
+// ─── /당번변경 ────────────────────────────────────────
+// 당번: /당번변경 06.02 파인트 지연
+// 크첵: /당번변경 06.02 파인트크첵 가영
+app.command('/당번변경', async ({ command, ack, respond }) => {
+  await ack();
+  const parts = command.text.trim().split(/\s+/);
+  if (parts.length !== 3) {
+    await respond({ text: '❌ 사용법:\n• 당번: `/당번변경 06.02 파인트 지연`\n• 크첵: `/당번변경 06.02 파인트크첵 가영`', response_type: 'ephemeral' }); return;
+  }
+  const [rawDate, loop, name] = parts;
+  const date = parseDate(rawDate);
+  if (!date) { await respond({ text: '❌ 날짜 형식: `06.02`', response_type: 'ephemeral' }); return; }
+
+  const loopKeyMap = { '파인트': 'pint', '스틱바': 'stick', '파인트크첵': 'pintCheck', '스틱바크첵': 'stickCheck' };
+  const key = loopKeyMap[loop];
+  if (!key) {
+    await respond({ text: '❌ 루프는 `파인트` `스틱바` `파인트크첵` `스틱바크첵` 중 하나로 입력해주세요.', response_type: 'ephemeral' }); return;
+  }
+  overrides[`${date}:${key}`] = name;
+  await respond({ text: `✅ *${dateLabel(date)} ${loop}* 을 *${name}* 님으로 변경했어요.`, response_type: 'in_channel' });
+});
 
 // ─── /당번취소 ────────────────────────────────────────
 app.command('/당번취소', async ({ command, ack, respond }) => {
   await ack();
   const parts = command.text.trim().split(/\s+/);
   const rawDate = parts[0];
-  const slot = parts[1] || null;
+  const loop = parts[1] || null;
   const date = parseDate(rawDate);
-  if (!date) { await respond({ text: '❌ 날짜 형식: `05.20`', response_type: 'ephemeral' }); return; }
-  if (slot && slot !== '오전' && slot !== '오후') { await respond({ text: '❌ 시간대는 `오전` 또는 `오후`로 입력해주세요.', response_type: 'ephemeral' }); return; }
-  if (slot) {
-    const key = `${date}:${slot}`;
-    if (overrides[key]) { delete overrides[key]; await respond({ text: `↩️ *${dateLabel(date)} ${slot}* 변경을 취소했어요.`, response_type: 'in_channel' }); }
-    else await respond({ text: `ℹ️ *${dateLabel(date)} ${slot}*에 수동 변경된 당번이 없어요.`, response_type: 'ephemeral' });
-    return;
-  }
-  const removed = [];
-  [date, `${date}:오전`, `${date}:오후`].forEach(k => { if (overrides[k]) { delete overrides[k]; removed.push(k); } });
-  if (removed.length > 0) await respond({ text: `↩️ *${dateLabel(date)}* 당번 변경을 취소했어요.`, response_type: 'in_channel' });
-  else await respond({ text: `ℹ️ *${dateLabel(date)}*에 수동 변경된 당번이 없어요.`, response_type: 'ephemeral' });
-});
+  if (!date) { await respond({ text: '❌ 날짜 형식: `06.02`', response_type: 'ephemeral' }); return; }
 
-// ─── /당번변경 ────────────────────────────────────────
-app.command('/당번변경', async ({ command, ack, respond }) => {
-  await ack();
-  const parts = command.text.trim().split(/\s+/);
-  if (parts.length === 3) {
-    const [rawDate, slot, name] = parts;
-    const date = parseDate(rawDate);
-    if (!date) { await respond({ text: '❌ 날짜 형식: `05.20`', response_type: 'ephemeral' }); return; }
-    if (slot !== '오전' && slot !== '오후') { await respond({ text: '❌ 시간대는 `오전` 또는 `오후`로 입력해주세요.', response_type: 'ephemeral' }); return; }
-    overrides[`${date}:${slot}`] = name;
-    await respond({ text: `✅ *${dateLabel(date)} ${slot}* 당번을 *${name}* 님으로 변경했어요.`, response_type: 'in_channel' });
+  const loopKeyMap = { '파인트': 'pint', '스틱바': 'stick', '파인트크첵': 'pintCheck', '스틱바크첵': 'stickCheck' };
+
+  if (loop) {
+    const key = loopKeyMap[loop];
+    if (!key) {
+      await respond({ text: '❌ 루프는 `파인트` `스틱바` `파인트크첵` `스틱바크첵` 중 하나로 입력해주세요.', response_type: 'ephemeral' }); return;
+    }
+    const overrideKey = `${date}:${key}`;
+    if (overrides[overrideKey]) { delete overrides[overrideKey]; await respond({ text: `↩️ *${dateLabel(date)} ${loop}* 변경을 취소했어요.`, response_type: 'in_channel' }); }
+    else await respond({ text: `ℹ️ 변경된 내용이 없어요.`, response_type: 'ephemeral' });
     return;
   }
-  if (parts.length === 2) {
-    const [rawDate, name] = parts;
-    const date = parseDate(rawDate);
-    if (!date) { await respond({ text: '❌ 날짜 형식: `05.20`', response_type: 'ephemeral' }); return; }
-    overrides[date] = name;
-    await respond({ text: `✅ *${dateLabel(date)}* 당번을 *${name}* 님으로 변경했어요.`, response_type: 'in_channel' });
-    return;
-  }
-  await respond({ text: '❌ 사용법:\n• 하루 전체: `/당번변경 05.20 고가영`\n• 시간대 지정: `/당번변경 05.20 오후 고가영`', response_type: 'ephemeral' });
+
+  const removed = [];
+  [`${date}:pint`, `${date}:stick`, `${date}:pintCheck`, `${date}:stickCheck`].forEach(k => {
+    if (overrides[k]) { delete overrides[k]; removed.push(k); }
+  });
+  if (removed.length > 0) await respond({ text: `↩️ *${dateLabel(date)}* 전체 변경을 취소했어요.`, response_type: 'in_channel' });
+  else await respond({ text: `ℹ️ 변경된 내용이 없어요.`, response_type: 'ephemeral' });
 });
 
 // ─── /당번주간 ────────────────────────────────────────
@@ -212,50 +247,58 @@ app.command('/당번요청', async ({ command, ack, client, respond }) => {
   await ack();
   const parts = command.text.trim().split(/\s+/);
   const rawDate = parts[0];
-  const slot = parts[1] || null;
+  const loop = parts[1] || null;
   const date = parseDate(rawDate);
-  if (!date) { await respond({ text: '❌ 사용법:\n• 하루 전체: `/당번요청 05.20`\n• 시간대 지정: `/당번요청 05.20 오후`', response_type: 'ephemeral' }); return; }
-  if (slot && slot !== '오전' && slot !== '오후') { await respond({ text: '❌ 시간대는 `오전` 또는 `오후`로 입력해주세요.', response_type: 'ephemeral' }); return; }
-  const slotText = slot ? ` ${slot}` : '';
+  if (!date) { await respond({ text: '❌ 사용법: `/당번요청 06.02 파인트`', response_type: 'ephemeral' }); return; }
+  if (loop && loop !== '파인트' && loop !== '스틱바') {
+    await respond({ text: '❌ 루프는 `파인트` 또는 `스틱바`로 입력해주세요.', response_type: 'ephemeral' }); return;
+  }
+  const loopText = loop ? ` ${loop}` : '';
   const requester = await getRealName(client, command.user_id);
   const label = dateLabel(date);
-  const actionValue = JSON.stringify({ date, slot: slot || null, requester });
+  const actionValue = JSON.stringify({ date, loop: loop || null, requester });
   await client.chat.postMessage({
     channel: CONFIG.notifyChannel,
     text: `🙏 당번 교체 요청`,
     blocks: [
-      { type: 'section', text: { type: 'mrkdwn', text: `🙏 *당번 교체 요청*\n\n*${label}${slotText}* 당번을 대신 해주실 분 있으신가요?\n요청자: *${requester}* 님` } },
+      { type: 'section', text: { type: 'mrkdwn', text: `🙏 *당번 교체 요청*\n\n*${label}${loopText}* 당번을 대신 해주실 분 있으신가요?\n요청자: *${requester}* 님` } },
       { type: 'actions', elements: [
         { type: 'button', text: { type: 'plain_text', text: '✅ 수락' }, style: 'primary', action_id: 'duty_accept', value: actionValue },
         { type: 'button', text: { type: 'plain_text', text: '❌ 거절' }, style: 'danger', action_id: 'duty_decline', value: actionValue },
       ]},
     ],
   });
-  await respond({ text: `📨 *${label}${slotText}* 교체 요청을 채널에 보냈어요.`, response_type: 'ephemeral' });
+  await respond({ text: `📨 *${label}${loopText}* 교체 요청을 채널에 보냈어요.`, response_type: 'ephemeral' });
 });
 
 // ─── 수락 버튼 ───────────────────────────────────────
 app.action('duty_accept', async ({ body, ack, client }) => {
   await ack();
-  const { date, slot, requester } = JSON.parse(body.actions[0].value);
+  const { date, loop, requester } = JSON.parse(body.actions[0].value);
   const acceptor = await getRealName(app.client, body.user.id);
   const label = dateLabel(date);
-  const slotText = slot ? ` ${slot}` : '';
-  if (slot) { overrides[`${date}:${slot}`] = acceptor; } else { overrides[date] = acceptor; }
+  const loopText = loop ? ` ${loop}` : '';
+  if (loop) {
+    const key = loop === '파인트' ? 'pint' : 'stick';
+    overrides[`${date}:${key}`] = acceptor;
+  } else {
+    overrides[`${date}:pint`] = acceptor;
+    overrides[`${date}:stick`] = acceptor;
+  }
   await client.chat.update({
     channel: body.channel.id, ts: body.message.ts, text: `✅ 당번 교체 완료`,
-    blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `✅ *당번 교체 완료*\n\n*${label}${slotText}* 당번이 *${acceptor}* 님으로 변경됐어요!\n${requester} 님 → *${acceptor}* 님 🎉` } }],
+    blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `✅ *당번 교체 완료*\n\n*${label}${loopText}* 당번이 *${acceptor}* 님으로 변경됐어요!\n${requester} 님 → *${acceptor}* 님 🎉` } }],
   });
 });
 
 // ─── 거절 버튼 ───────────────────────────────────────
 app.action('duty_decline', async ({ body, ack, client }) => {
   await ack();
-  const { date, slot, requester } = JSON.parse(body.actions[0].value);
+  const { date, loop, requester } = JSON.parse(body.actions[0].value);
   const decliner = await getRealName(app.client, body.user.id);
   const label = dateLabel(date);
-  const slotText = slot ? ` ${slot}` : '';
-  await client.chat.postMessage({ channel: body.channel.id, thread_ts: body.message.ts, text: `*${decliner}* 님이 *${label}${slotText}* 교체 요청을 거절했어요.` });
+  const loopText = loop ? ` ${loop}` : '';
+  await client.chat.postMessage({ channel: body.channel.id, thread_ts: body.message.ts, text: `*${decliner}* 님이 *${label}${loopText}* 교체 요청을 거절했어요.` });
 });
 
 // ─── 매주 월요일 07:30 — 새 주간 스레드 생성 ─────────
@@ -269,7 +312,7 @@ cron.schedule(CONFIG.weeklyTime, async () => {
   weeklyThreadTs = res.ts;
 }, { timezone: 'Asia/Seoul' });
 
-// ─── 매일 07:30 — 오늘 당번 알림 + 당번 태그 ─────────
+// ─── 매일 07:30 — 오늘 당번 알림 + 태그 ─────────────
 cron.schedule(CONFIG.notifyTime, async () => {
   const today = todayStr();
   await ensureWeeklyThread();
@@ -280,7 +323,7 @@ cron.schedule(CONFIG.notifyTime, async () => {
   });
 }, { timezone: 'Asia/Seoul' });
 
-// ─── 매일 18:00 — 내일 당번 예고 + 내일 당번 태그 ────
+// ─── 매일 18:00 — 내일 당번 예고 + 태그 ─────────────
 cron.schedule(CONFIG.eveningNotifyTime, async () => {
   const tomorrow = new Date();
   tomorrow.setDate(tomorrow.getDate() + 1);
