@@ -218,25 +218,37 @@ async function ensureWeeklyThread() {
 }
 
 // ─── /당번변경 ────────────────────────────────────────
-// 당번: /당번변경 06.02 파인트 지연
-// 크첵: /당번변경 06.02 파인트크첵 가영
+// 메인만: /당번변경 06.02 파인트 박지연
+// 메인+크첵: /당번변경 06.02 파인트 박지연(이석영)
 app.command('/당번변경', async ({ command, ack, respond }) => {
   await ack();
   const parts = command.text.trim().split(/\s+/);
   if (parts.length !== 3) {
-    await respond({ text: '❌ 사용법:\n• 당번: `/당번변경 06.02 파인트 지연`\n• 크첵: `/당번변경 06.02 파인트크첵 가영`', response_type: 'ephemeral' }); return;
+    await respond({ text: '❌ 사용법:\n• 메인만: `/당번변경 06.02 파인트 박지연`\n• 메인+크첵: `/당번변경 06.02 파인트 박지연(이석영)`', response_type: 'ephemeral' }); return;
   }
-  const [rawDate, loop, name] = parts;
+  const [rawDate, loop, nameInput] = parts;
   const date = parseDate(rawDate);
   if (!date) { await respond({ text: '❌ 날짜 형식: `06.02`', response_type: 'ephemeral' }); return; }
 
-  const loopKeyMap = { '파인트': 'pint', '스틱바': 'stick', '파인트크첵': 'pintCheck', '스틱바크첵': 'stickCheck' };
+  const loopKeyMap = { '파인트': 'pint', '스틱바': 'stick' };
   const key = loopKeyMap[loop];
   if (!key) {
-    await respond({ text: '❌ 루프는 `파인트` `스틱바` `파인트크첵` `스틱바크첵` 중 하나로 입력해주세요.', response_type: 'ephemeral' }); return;
+    await respond({ text: '❌ 루프는 `파인트` 또는 `스틱바`로 입력해주세요.', response_type: 'ephemeral' }); return;
   }
-  overrides[`${date}:${key}`] = name;
-  await respond({ text: `✅ *${dateLabel(date)} ${loop}* 을 *${name}* 님으로 변경했어요.`, response_type: 'in_channel' });
+
+  // 메인(크첵) 형태 파싱
+  const combinedMatch = nameInput.match(/^(.+?)\((.+?)\)$/);
+  if (combinedMatch) {
+    const [, mainName, checkName] = combinedMatch;
+    const checkKeyMap = { 'pint': 'pintCheck', 'stick': 'stickCheck' };
+    overrides[`${date}:${key}`] = mainName;
+    overrides[`${date}:${checkKeyMap[key]}`] = checkName;
+    await respond({ text: `✅ *${dateLabel(date)} ${loop}* 당번 *${mainName}* 님, 크첵 *${checkName}* 님으로 변경했어요.`, response_type: 'in_channel' });
+    return;
+  }
+
+  overrides[`${date}:${key}`] = nameInput;
+  await respond({ text: `✅ *${dateLabel(date)} ${loop}* 을 *${nameInput}* 님으로 변경했어요.`, response_type: 'in_channel' });
 });
 
 // ─── /당번취소 ────────────────────────────────────────
@@ -248,12 +260,12 @@ app.command('/당번취소', async ({ command, ack, respond }) => {
   const date = parseDate(rawDate);
   if (!date) { await respond({ text: '❌ 날짜 형식: `06.02`', response_type: 'ephemeral' }); return; }
 
-  const loopKeyMap = { '파인트': 'pint', '스틱바': 'stick', '파인트크첵': 'pintCheck', '스틱바크첵': 'stickCheck' };
+  const loopKeyMap = { '파인트': 'pint', '스틱바': 'stick' };
 
   if (loop) {
     const key = loopKeyMap[loop];
     if (!key) {
-      await respond({ text: '❌ 루프는 `파인트` `스틱바` `파인트크첵` `스틱바크첵` 중 하나로 입력해주세요.', response_type: 'ephemeral' }); return;
+      await respond({ text: '❌ 루프는 `파인트` 또는 `스틱바`로 입력해주세요.', response_type: 'ephemeral' }); return;
     }
     const overrideKey = `${date}:${key}`;
     if (overrides[overrideKey]) { delete overrides[overrideKey]; await respond({ text: `↩️ *${dateLabel(date)} ${loop}* 변경을 취소했어요.`, response_type: 'in_channel' }); }
@@ -275,6 +287,30 @@ app.command('/당번주간', async ({ ack, respond }) => {
   const today = todayStr();
   const label = getWeekLabel(today);
   await respond({ text: `📅 *${label} 당번 일정*\n${weeklyMessage(today)}`, response_type: 'ephemeral' });
+});
+
+// ─── /당번날짜 : 특정 날짜 당번 조회 ─────────────────
+app.command('/당번날짜', async ({ command, ack, respond }) => {
+  await ack();
+  const rawDate = command.text.trim();
+  const date = parseDate(rawDate);
+  if (!date) {
+    await respond({ text: '❌ 날짜 형식: `06.04`', response_type: 'ephemeral' }); return;
+  }
+  let text;
+  if (isLegacyDate(date)) {
+    const member = getLegacyMember(date) || '—';
+    text = `📅 *${dateLabel(date)}* 당번: *${member}* 님`;
+  } else {
+    const pintMain = getPintMain(date) || '—';
+    const stickMain = getStickMain(date) || '—';
+    const pintCheck = getPintCheck(date);
+    const stickCheck = getStickCheck(date);
+    const pintLine = pintCheck ? `${pintMain} (${pintCheck})` : pintMain;
+    const stickLine = stickCheck ? `${stickMain} (${stickCheck})` : stickMain;
+    text = `📅 *${dateLabel(date)}*\n\n📍 파인트: ${pintLine}\n📍 스틱바: ${stickLine}`;
+  }
+  await respond({ text, response_type: 'ephemeral' });
 });
 
 // ─── /당번요청 ────────────────────────────────────────
