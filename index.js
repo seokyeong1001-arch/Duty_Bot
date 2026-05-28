@@ -8,30 +8,35 @@ const app = new App({
 
 // ─── 설정 (여기만 수정) ───────────────────────────────
 const CONFIG = {
-  startDate: '2026-06-01', // 가영/선정이 첫날 당번
+  startDate: '2026-06-01', // 파인트/스틱바 2루프 시작일
   notifyChannel: process.env.SLACK_CHANNEL,
   notifyTime: '30 7 * * *',
   weeklyTime: '30 7 * * 1',
   eveningNotifyTime: '0 18 * * *',
 
-  // 파인트 루프: 가영 ↔ 지연 하루씩 교대
-  pint: ['고가영', '지연'],
-  // 스틱바 루프: 선정 ↔ 유진 하루씩 교대
-  stick: ['문선정', '유진'],
+  // 파인트 루프: 고가영 ↔ 박지연 하루씩 교대
+  pint: ['고가영', '박지연'],
+  // 스틱바 루프: 문선정 ↔ 김유진 하루씩 교대
+  stick: ['문선정', '김유진'],
 
-  // 크첵 패턴 (지연/유진 당번날에만 붙음)
-  // 파인트 크첵: 석영 → 가영 → 석영 → 가영 ...
+  // 크첵 패턴 (박지연/김유진 당번날에만 붙음)
+  // 파인트 크첵: 이석영 → 고가영 → 이석영 → 고가영 ...
   pintCheck: ['이석영', '고가영'],
-  // 스틱바 크첵: 선정 → 석영 → 선정 → 석영 ...
+  // 스틱바 크첵: 문선정 → 이석영 → 문선정 → 이석영 ...
   stickCheck: ['문선정', '이석영'],
 
   memberIds: {
     '고가영': 'U0A4DMQ1D99',
-    '지연': 'U0AMT81HV42',
+    '박지연': 'U0AMT81HV42',
     '문선정': 'U07N2D1DYE6',
-    '유진': 'U0AMPR3Q09K',
+    '김유진': 'U0AMPR3Q09K',
     '이석영': 'U06TTAA85TQ',
   },
+
+  // 6월 이전 단일 루프 설정
+  legacyStartDate: '2026-05-25',
+  legacyMembers: ['문선정', '고가영', '이석영'],
+  legacyEndDate: '2026-05-31',
 };
 // ─────────────────────────────────────────────────────
 
@@ -69,6 +74,19 @@ function dayDiff(dateStr) {
   const start = new Date(CONFIG.startDate);
   const target = new Date(dateStr);
   return Math.round((target - start) / (1000 * 60 * 60 * 24));
+}
+
+// 5/25~5/31 단일 루프
+function getLegacyMember(dateStr) {
+  const start = new Date(CONFIG.legacyStartDate);
+  const target = new Date(dateStr);
+  const diff = Math.round((target - start) / (1000 * 60 * 60 * 24));
+  if (diff < 0) return null;
+  return CONFIG.legacyMembers[diff % CONFIG.legacyMembers.length];
+}
+
+function isLegacyDate(dateStr) {
+  return dateStr >= CONFIG.legacyStartDate && dateStr <= CONFIG.legacyEndDate;
 }
 
 // 파인트 당번 (가영=짝수일, 지연=홀수일)
@@ -124,13 +142,18 @@ function formatDutyLine(main, check, withTag) {
   const mainText = withTag ? mentionTag(main) : `*${main}*`;
   if (check) {
     const checkText = withTag ? mentionTag(check) : `*${check}*`;
-    return `${mainText} + ${checkText} (크첵)`;
+    return `${mainText} (${checkText})`;
   }
   return mainText;
 }
 
 function dutyMessage(dateStr, withTag = false) {
   const label = dateLabel(dateStr);
+  if (isLegacyDate(dateStr)) {
+    const member = getLegacyMember(dateStr);
+    const memberText = member ? (withTag ? mentionTag(member) : `*${member}*`) : '—';
+    return `🔔 *[당번 알림]* ${label}\n\n오늘 당번은 ${memberText} 님입니다! 수고해주세요 💪`;
+  }
   const pintMain = getPintMain(dateStr);
   const stickMain = getStickMain(dateStr);
   const pintCheck = getPintCheck(dateStr);
@@ -142,6 +165,11 @@ function dutyMessage(dateStr, withTag = false) {
 
 function eveningMessage(tomorrowStr, withTag = false) {
   const label = dateLabel(tomorrowStr);
+  if (isLegacyDate(tomorrowStr)) {
+    const member = getLegacyMember(tomorrowStr);
+    const memberText = member ? (withTag ? mentionTag(member) : `*${member}*`) : '—';
+    return `🌙 *[내일 당번 예고]* ${label}\n\n내일 당번은 ${memberText} 님입니다!`;
+  }
   const pintMain = getPintMain(tomorrowStr);
   const stickMain = getStickMain(tomorrowStr);
   const pintCheck = getPintCheck(tomorrowStr);
@@ -160,13 +188,20 @@ function weeklyMessage(fromDateStr) {
     const ds = d.toLocaleDateString('sv-SE');
     const [, mm, dd] = ds.split('-');
     const day = dayNames[d.getDay()];
-    const pintMain = getPintMain(ds) || '—';
-    const stickMain = getStickMain(ds) || '—';
-    const pintCheck = getPintCheck(ds);
-    const stickCheck = getStickCheck(ds);
-    const pintLine = pintCheck ? `${pintMain} + ${pintCheck}(크첵)` : pintMain;
-    const stickLine = stickCheck ? `${stickMain} + ${stickCheck}(크첵)` : stickMain;
-    lines.push(`• ${mm}/${dd} (${day})  파인트: ${pintLine}  |  스틱바: ${stickLine}`);
+    let line;
+    if (isLegacyDate(ds)) {
+      const member = getLegacyMember(ds) || '—';
+      line = `• ${mm}/${dd} (${day})  ${member}`;
+    } else {
+      const pintMain = getPintMain(ds) || '—';
+      const stickMain = getStickMain(ds) || '—';
+      const pintCheck = getPintCheck(ds);
+      const stickCheck = getStickCheck(ds);
+      const pintLine = pintCheck ? `${pintMain} (${pintCheck})` : pintMain;
+      const stickLine = stickCheck ? `${stickMain} (${stickCheck})` : stickMain;
+      line = `• ${mm}/${dd} (${day})  파인트: ${pintLine}  |  스틱바: ${stickLine}`;
+    }
+    lines.push(line);
   }
   return lines.join('\n');
 }
