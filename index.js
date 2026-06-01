@@ -1,5 +1,29 @@
 const { App } = require('@slack/bolt');
 const cron = require('node-cron');
+const fs = require('fs');
+const path = require('path');
+
+const THREAD_TS_FILE = path.join('/tmp', 'weekly_thread_ts.json');
+
+function loadThreadTs() {
+  // 환경변수 우선 확인
+  if (process.env.WEEKLY_THREAD_TS) return process.env.WEEKLY_THREAD_TS;
+  try {
+    if (fs.existsSync(THREAD_TS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(THREAD_TS_FILE, 'utf8'));
+      return data.ts || null;
+    }
+  } catch (e) {}
+  return null;
+}
+
+function saveThreadTs(ts) {
+  try {
+    fs.writeFileSync(THREAD_TS_FILE, JSON.stringify({ ts }), 'utf8');
+  } catch (e) {
+    console.error('스레드 ts 저장 실패:', e.message);
+  }
+}
 
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
@@ -42,7 +66,7 @@ const CONFIG = {
 
 const overrides = {};
 let botUserId = null; // { 'YYYY-MM-DD:pint': '이름', 'YYYY-MM-DD:stick': '이름' }
-let weeklyThreadTs = null;
+let weeklyThreadTs = loadThreadTs();
 
 function getWeekLabel(dateStr) {
   const d = new Date(dateStr);
@@ -141,7 +165,7 @@ function dateLabel(dateStr) {
 
 function formatDutyLine(main, check, withTag) {
   const mainText = withTag ? mentionTag(main) : `*${main}*`;
-  if (check) {
+  if (check && check !== 'NONE') {
     const checkText = withTag ? mentionTag(check) : `*${check}*`;
     return `${mainText} (${checkText})`;
   }
@@ -198,8 +222,8 @@ function weeklyMessage(fromDateStr) {
       const stickMain = getStickMain(ds) || '—';
       const pintCheck = getPintCheck(ds);
       const stickCheck = getStickCheck(ds);
-      const pintLine = pintCheck ? `${pintMain} (${pintCheck})` : pintMain;
-      const stickLine = stickCheck ? `${stickMain} (${stickCheck})` : stickMain;
+      const pintLine = (pintCheck && pintCheck !== 'NONE') ? `${pintMain} (${pintCheck})` : pintMain;
+      const stickLine = (stickCheck && stickCheck !== 'NONE') ? `${stickMain} (${stickCheck})` : stickMain;
       line = `• ${mm}/${dd} (${day})  파인트: ${pintLine}  |  스틱바: ${stickLine}`;
     }
     lines.push(line);
@@ -444,6 +468,7 @@ cron.schedule(CONFIG.weeklyTime, async () => {
     text: `📅 *${weekLabel} 당번 일정*\n\n${weeklyMessage(today)}`,
   });
   weeklyThreadTs = res.ts;
+  saveThreadTs(res.ts);
 }, { timezone: 'Asia/Seoul' });
 
 // ─── 매일 07:30 — 오늘 당번 알림 + 태그 ─────────────
@@ -507,8 +532,8 @@ app.event('app_mention', async ({ event, client, say }) => {
       const stickMain = getStickMain(date) || '—';
       const pintCheck = getPintCheck(date);
       const stickCheck = getStickCheck(date);
-      const pintLine = pintCheck ? `${pintMain} (${pintCheck})` : pintMain;
-      const stickLine = stickCheck ? `${stickMain} (${stickCheck})` : stickMain;
+      const pintLine = (pintCheck && pintCheck !== 'NONE') ? `${pintMain} (${pintCheck})` : pintMain;
+      const stickLine = (stickCheck && stickCheck !== 'NONE') ? `${stickMain} (${stickCheck})` : stickMain;
       text = `📅 *${dateLabel(date)}*\n\n📍 파인트: ${pintLine}\n📍 스틱바: ${stickLine}`;
     }
     await reply(text); return;
