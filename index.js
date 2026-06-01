@@ -40,7 +40,8 @@ const CONFIG = {
 };
 // ─────────────────────────────────────────────────────
 
-const overrides = {}; // { 'YYYY-MM-DD:pint': '이름', 'YYYY-MM-DD:stick': '이름' }
+const overrides = {};
+let botUserId = null; // { 'YYYY-MM-DD:pint': '이름', 'YYYY-MM-DD:stick': '이름' }
 let weeklyThreadTs = null;
 
 function getWeekLabel(dateStr) {
@@ -206,6 +207,34 @@ function weeklyMessage(fromDateStr) {
   return lines.join('\n');
 }
 
+
+const MANUAL_TEXT = `📖 *당번봇 매뉴얼*
+
+*📌 슬래시 커맨드*
+\`/당번변경 06.04 파인트 박지연\` — 파인트 메인 변경
+\`/당번변경 06.04 파인트 박지연(이석영)\` — 파인트 메인+크첵 변경
+\`/당번취소 06.04 파인트\` — 파인트 변경 취소
+\`/당번취소 06.04 스틱바\` — 스틱바 변경 취소
+\`/당번취소 06.04\` — 해당 날짜 전체 취소
+\`/당번요청 06.04 파인트\` — 파인트 교체 요청
+\`/당번주간\` — 이번 주 일정 나만 보기
+\`/당번날짜 06.04\` — 특정 날짜 당번 조회
+\`/당번매뉴얼\` — 이 매뉴얼 보기
+
+*💬 멘션 커맨드 (스레드에서도 사용 가능)*
+\`@당번봇 변경 06.04 파인트 박지연\`
+\`@당번봇 변경 06.04 파인트 박지연(이석영)\`
+\`@당번봇 취소 06.04 파인트\`
+\`@당번봇 요청 06.04 파인트\`
+\`@당번봇 주간\`
+\`@당번봇 날짜 06.04\`
+\`@당번봇 매뉴얼\`
+
+*📅 자동 알림*
+• 매일 07:30 — 오늘 당번 알림 (당번자 태그)
+• 매일 18:00 — 내일 당번 예고 (당번자 태그)
+• 매주 월요일 07:30 — 주간 스레드 생성`;
+
 async function ensureWeeklyThread() {
   if (weeklyThreadTs) return;
   const today = todayStr();
@@ -248,6 +277,9 @@ app.command('/당번변경', async ({ command, ack, respond }) => {
   }
 
   overrides[`${date}:${key}`] = nameInput;
+  // 메인만 변경 시 해당 루프 크첵도 초기화
+  const checkKeyMap2 = { 'pint': 'pintCheck', 'stick': 'stickCheck' };
+  if (checkKeyMap2[key]) delete overrides[`${date}:${checkKeyMap2[key]}`];
   await respond({ text: `✅ *${dateLabel(date)} ${loop}* 을 *${nameInput}* 님으로 변경했어요.`, response_type: 'in_channel' });
 });
 
@@ -372,6 +404,12 @@ app.action('duty_decline', async ({ body, ack, client }) => {
   await client.chat.postMessage({ channel: body.channel.id, thread_ts: body.message.ts, text: `*${decliner}* 님이 *${label}${loopText}* 교체 요청을 거절했어요.` });
 });
 
+// ─── /당번매뉴얼 ─────────────────────────────────────
+app.command('/당번매뉴얼', async ({ ack, respond }) => {
+  await ack();
+  await respond({ text: MANUAL_TEXT, response_type: 'ephemeral' });
+});
+
 // ─── 매주 월요일 07:30 — 새 주간 스레드 생성 ─────────
 cron.schedule(CONFIG.weeklyTime, async () => {
   const today = todayStr();
@@ -407,8 +445,133 @@ cron.schedule(CONFIG.eveningNotifyTime, async () => {
   });
 }, { timezone: 'Asia/Seoul' });
 
+// ─── @당번봇 멘션 처리 ───────────────────────────────
+app.event('app_mention', async ({ event, client, say }) => {
+  const text = event.text.replace(/<@[A-Z0-9]+>/g, '').trim();
+  const parts = text.split(/\s+/).filter(Boolean);
+  const cmd = parts[0];
+  const threadTs = event.thread_ts || event.ts;
+
+  const reply = async (msg) => {
+    await say({ text: msg, thread_ts: threadTs });
+  };
+
+  // 매뉴얼
+  if (!cmd || cmd === '매뉴얼') {
+    await reply(MANUAL_TEXT); return;
+  }
+
+  // 주간
+  if (cmd === '주간') {
+    const today = todayStr();
+    const label = getWeekLabel(today);
+    await reply(`📅 *${label} 당번 일정*\n${weeklyMessage(today)}`); return;
+  }
+
+  // 날짜
+  if (cmd === '날짜') {
+    const rawDate = parts[1];
+    const date = parseDate(rawDate);
+    if (!date) { await reply('❌ 날짜 형식: `06.04`'); return; }
+    let text;
+    if (isLegacyDate(date)) {
+      const member = getLegacyMember(date) || '—';
+      text = `📅 *${dateLabel(date)}* 당번: *${member}* 님`;
+    } else {
+      const pintMain = getPintMain(date) || '—';
+      const stickMain = getStickMain(date) || '—';
+      const pintCheck = getPintCheck(date);
+      const stickCheck = getStickCheck(date);
+      const pintLine = pintCheck ? `${pintMain} (${pintCheck})` : pintMain;
+      const stickLine = stickCheck ? `${stickMain} (${stickCheck})` : stickMain;
+      text = `📅 *${dateLabel(date)}*\n\n📍 파인트: ${pintLine}\n📍 스틱바: ${stickLine}`;
+    }
+    await reply(text); return;
+  }
+
+  // 변경
+  if (cmd === '변경') {
+    if (parts.length !== 3) { await reply('❌ 사용법:\n• `@당번봇 변경 06.04 파인트 박지연`\n• `@당번봇 변경 06.04 파인트 박지연(이석영)`'); return; }
+    const [, rawDate, loop, nameInput] = parts;
+    const date = parseDate(rawDate);
+    if (!date) { await reply('❌ 날짜 형식: `06.04`'); return; }
+    const loopKeyMap = { '파인트': 'pint', '스틱바': 'stick' };
+    const key = loopKeyMap[loop];
+    if (!key) { await reply('❌ 루프는 `파인트` 또는 `스틱바`로 입력해주세요.'); return; }
+    const combinedMatch = nameInput.match(/^(.+?)\((.+?)\)$/);
+    if (combinedMatch) {
+      const [, mainName, checkName] = combinedMatch;
+      const checkKeyMap = { 'pint': 'pintCheck', 'stick': 'stickCheck' };
+      overrides[`${date}:${key}`] = mainName;
+      overrides[`${date}:${checkKeyMap[key]}`] = checkName;
+      await reply(`✅ *${dateLabel(date)} ${loop}* 당번 *${mainName}* 님, 크첵 *${checkName}* 님으로 변경했어요.`);
+      return;
+    }
+    overrides[`${date}:${key}`] = nameInput;
+    const checkKeyMap2 = { 'pint': 'pintCheck', 'stick': 'stickCheck' };
+    if (checkKeyMap2[key]) delete overrides[`${date}:${checkKeyMap2[key]}`];
+    await reply(`✅ *${dateLabel(date)} ${loop}* 을 *${nameInput}* 님으로 변경했어요.`);
+    return;
+  }
+
+  // 취소
+  if (cmd === '취소') {
+    const rawDate = parts[1];
+    const loop = parts[2] || null;
+    const date = parseDate(rawDate);
+    if (!date) { await reply('❌ 날짜 형식: `06.04`'); return; }
+    const loopKeyMap = { '파인트': 'pint', '스틱바': 'stick' };
+    if (loop) {
+      const key = loopKeyMap[loop];
+      if (!key) { await reply('❌ 루프는 `파인트` 또는 `스틱바`로 입력해주세요.'); return; }
+      const overrideKey = `${date}:${key}`;
+      if (overrides[overrideKey]) { delete overrides[overrideKey]; await reply(`↩️ *${dateLabel(date)} ${loop}* 변경을 취소했어요.`); }
+      else await reply(`ℹ️ 변경된 내용이 없어요.`);
+      return;
+    }
+    const removed = [];
+    [`${date}:pint`, `${date}:stick`, `${date}:pintCheck`, `${date}:stickCheck`].forEach(k => {
+      if (overrides[k]) { delete overrides[k]; removed.push(k); }
+    });
+    if (removed.length > 0) await reply(`↩️ *${dateLabel(date)}* 전체 변경을 취소했어요.`);
+    else await reply(`ℹ️ 변경된 내용이 없어요.`);
+    return;
+  }
+
+  // 요청
+  if (cmd === '요청') {
+    const rawDate = parts[1];
+    const loop = parts[2] || null;
+    const date = parseDate(rawDate);
+    if (!date) { await reply('❌ 사용법: `@당번봇 요청 06.04 파인트`'); return; }
+    if (loop && loop !== '파인트' && loop !== '스틱바') { await reply('❌ 루프는 `파인트` 또는 `스틱바`로 입력해주세요.'); return; }
+    const loopText = loop ? ` ${loop}` : '';
+    const requester = event.user;
+    const requesterName = await getRealName(client, requester);
+    const label = dateLabel(date);
+    const actionValue = JSON.stringify({ date, loop: loop || null, requester: requesterName });
+    await client.chat.postMessage({
+      channel: event.channel,
+      thread_ts: threadTs,
+      text: `🙏 당번 교체 요청`,
+      blocks: [
+        { type: 'section', text: { type: 'mrkdwn', text: `🙏 *당번 교체 요청*\n\n*${label}${loopText}* 당번을 대신 해주실 분 있으신가요?\n요청자: *${requesterName}* 님` } },
+        { type: 'actions', elements: [
+          { type: 'button', text: { type: 'plain_text', text: '✅ 수락' }, style: 'primary', action_id: 'duty_accept', value: actionValue },
+          { type: 'button', text: { type: 'plain_text', text: '❌ 거절' }, style: 'danger', action_id: 'duty_decline', value: actionValue },
+        ]},
+      ],
+    });
+    return;
+  }
+
+  await reply(`❓ 모르는 명령어예요. \`@당번봇 매뉴얼\` 로 사용법을 확인해주세요!`);
+});
+
 // ─── 서버 시작 ────────────────────────────────────────
 (async () => {
   await app.start(process.env.PORT || 3000);
-  console.log('⚡ 당번 봇이 실행 중입니다!');
+  const authResult = await app.client.auth.test();
+  botUserId = authResult.user_id;
+  console.log('⚡ 당번 봇이 실행 중입니다! Bot ID:', botUserId);
 })();
