@@ -235,6 +235,31 @@ const MANUAL_TEXT = `📖 *당번봇 매뉴얼*
 • 매일 18:00 — 내일 당번 예고 (당번자 태그)
 • 매주 월요일 07:30 — 주간 스레드 생성`;
 
+
+// 주간 스레드 원본 메시지 업데이트
+async function updateWeeklyThread() {
+  if (!weeklyThreadTs) return;
+  try {
+    const today = todayStr();
+    // 스레드 시작일 기준으로 그 주 월요일 찾기
+    const threadDate = new Date(parseFloat(weeklyThreadTs) * 1000);
+    const threadDateStr = threadDate.toLocaleDateString('sv-SE', { timeZone: 'Asia/Seoul' });
+    const d = new Date(threadDateStr);
+    const dow = d.getDay();
+    const monday = new Date(d);
+    monday.setDate(d.getDate() - (dow === 0 ? 6 : dow - 1));
+    const mondayStr = monday.toLocaleDateString('sv-SE');
+    const weekLabel = getWeekLabel(mondayStr);
+    await app.client.chat.update({
+      channel: CONFIG.notifyChannel,
+      ts: weeklyThreadTs,
+      text: `📅 *${weekLabel} 당번 일정*\n\n${weeklyMessage(mondayStr)}`,
+    });
+  } catch (e) {
+    console.error('주간 스레드 업데이트 실패:', e.message);
+  }
+}
+
 async function ensureWeeklyThread() {
   if (weeklyThreadTs) return;
   const today = todayStr();
@@ -309,7 +334,7 @@ app.command('/당번취소', async ({ command, ack, respond }) => {
   [`${date}:pint`, `${date}:stick`, `${date}:pintCheck`, `${date}:stickCheck`].forEach(k => {
     if (overrides[k]) { delete overrides[k]; removed.push(k); }
   });
-  if (removed.length > 0) await respond({ text: `↩️ *${dateLabel(date)}* 전체 변경을 취소했어요.`, response_type: 'in_channel' });
+  if (removed.length > 0) { await updateWeeklyThread(); await respond({ text: `↩️ *${dateLabel(date)}* 전체 변경을 취소했어요.`, response_type: 'in_channel' }); }
   else await respond({ text: `ℹ️ 변경된 내용이 없어요.`, response_type: 'ephemeral' });
 });
 
@@ -504,12 +529,14 @@ app.event('app_mention', async ({ event, client, say }) => {
       const checkKeyMap = { 'pint': 'pintCheck', 'stick': 'stickCheck' };
       overrides[`${date}:${key}`] = mainName;
       overrides[`${date}:${checkKeyMap[key]}`] = checkName;
+      await updateWeeklyThread();
       await reply(`✅ *${dateLabel(date)} ${loop}* 당번 *${mainName}* 님, 크첵 *${checkName}* 님으로 변경했어요.`);
       return;
     }
     overrides[`${date}:${key}`] = nameInput;
     const checkKeyMap2 = { 'pint': 'pintCheck', 'stick': 'stickCheck' };
     if (checkKeyMap2[key]) delete overrides[`${date}:${checkKeyMap2[key]}`];
+    await updateWeeklyThread();
     await reply(`✅ *${dateLabel(date)} ${loop}* 을 *${nameInput}* 님으로 변경했어요.`);
     return;
   }
@@ -533,7 +560,7 @@ app.event('app_mention', async ({ event, client, say }) => {
     [`${date}:pint`, `${date}:stick`, `${date}:pintCheck`, `${date}:stickCheck`].forEach(k => {
       if (overrides[k]) { delete overrides[k]; removed.push(k); }
     });
-    if (removed.length > 0) await reply(`↩️ *${dateLabel(date)}* 전체 변경을 취소했어요.`);
+    if (removed.length > 0) { await updateWeeklyThread(); await reply(`↩️ *${dateLabel(date)}* 전체 변경을 취소했어요.`); }
     else await reply(`ℹ️ 변경된 내용이 없어요.`);
     return;
   }
