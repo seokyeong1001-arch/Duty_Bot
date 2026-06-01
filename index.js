@@ -516,7 +516,7 @@ app.event('app_mention', async ({ event, client, say }) => {
 
   // 변경
   if (cmd === '변경') {
-    if (parts.length !== 3) { await reply('❌ 사용법:\n• `@당번봇 변경 06.04 파인트 박지연`\n• `@당번봇 변경 06.04 파인트 박지연(이석영)`'); return; }
+    if (parts.length !== 4) { await reply('❌ 사용법:\n• `@당번봇 변경 06.04 파인트 박지연`\n• `@당번봇 변경 06.04 파인트 박지연(이석영)`'); return; }
     const [, rawDate, loop, nameInput] = parts;
     const date = parseDate(rawDate);
     if (!date) { await reply('❌ 날짜 형식: `06.04`'); return; }
