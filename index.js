@@ -535,7 +535,7 @@ app.event('app_mention', async ({ event, client, say }) => {
     }
     overrides[`${date}:${key}`] = nameInput;
     const checkKeyMap2 = { 'pint': 'pintCheck', 'stick': 'stickCheck' };
-    if (checkKeyMap2[key]) delete overrides[`${date}:${checkKeyMap2[key]}`];
+    if (checkKeyMap2[key]) overrides[`${date}:${checkKeyMap2[key]}`] = 'NONE';
     await updateWeeklyThread();
     await reply(`✅ *${dateLabel(date)} ${loop}* 을 *${nameInput}* 님으로 변경했어요.`);
     return;
