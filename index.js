@@ -315,7 +315,7 @@ const MANUAL_TEXT = `📖 *당번봇 매뉴얼*
 
 • 매일 07:30 — 오늘 당번 알림 (당번자 태그)
 • 매일 18:00 — 내일 당번 예고 (당번자 태그)
-• 매주 월요일 07:30 — 주간 스레드 생성`;
+• 매주 월요일 07:00 — 주간 스레드 생성`;
 
 // 주간 스레드 원본 메시지 업데이트
 async function updateWeeklyThread() {
@@ -379,6 +379,7 @@ app.command('/당번변경', async ({ command, ack, respond }) => {
     const checkKeyMap = { 'pint': 'pintCheck', 'stick': 'stickCheck' };
     overrides[`${date}:${key}`] = mainName;
     overrides[`${date}:${checkKeyMap[key]}`] = checkName;
+    await updateWeeklyThread();
     await respond({ text: `✅ *${dateLabel(date)} ${loop}* 당번 *${mainName}* 님, 크첵 *${checkName}* 님으로 변경했어요.`, response_type: 'in_channel' });
     return;
   }
@@ -387,6 +388,7 @@ app.command('/당번변경', async ({ command, ack, respond }) => {
   // 메인만 변경 시 해당 루프 크첵도 초기화
   const checkKeyMap2 = { 'pint': 'pintCheck', 'stick': 'stickCheck' };
   if (checkKeyMap2[key]) delete overrides[`${date}:${checkKeyMap2[key]}`];
+  await updateWeeklyThread();
   await respond({ text: `✅ *${dateLabel(date)} ${loop}* 을 *${nameInput}* 님으로 변경했어요.`, response_type: 'in_channel' });
 });
 
@@ -519,6 +521,7 @@ app.action('duty_accept', async ({ body, ack, client }) => {
     channel: body.channel.id, ts: body.message.ts, text: `✅ 당번 교체 완료`,
     blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `✅ *당번 교체 완료*\n\n*${label}${loopText}* 당번이 *${acceptor}* 님으로 변경됐어요!\n${requester} 님 → *${acceptor}* 님 🎉` } }],
   });
+  await updateWeeklyThread();
 });
 
 // ─── 거절 버튼 ───────────────────────────────────────
@@ -537,7 +540,7 @@ app.command('/당번매뉴얼', async ({ ack, respond }) => {
   await respond({ text: MANUAL_TEXT, response_type: 'ephemeral' });
 });
 
-// ─── 매주 월요일 07:30 — 새 주간 스레드 생성 ─────────
+// ─── 매주 월요일 07:00 — 새 주간 스레드 생성 ─────────
 cron.schedule(CONFIG.weeklyTime, async () => {
   const today = todayStr();
   const weekLabel = getWeekLabel(today);
