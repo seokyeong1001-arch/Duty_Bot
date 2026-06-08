@@ -6,14 +6,14 @@ const path = require('path');
 const THREAD_TS_FILE = path.join('/tmp', 'weekly_thread_ts.json');
 
 function loadThreadTs() {
-  // 환경변수 우선 확인
-  if (process.env.WEEKLY_THREAD_TS) return process.env.WEEKLY_THREAD_TS;
+  // 파일 우선 (최신 스레드), 없으면 환경변수 초기값
   try {
     if (fs.existsSync(THREAD_TS_FILE)) {
       const data = JSON.parse(fs.readFileSync(THREAD_TS_FILE, 'utf8'));
-      return data.ts || null;
+      if (data.ts) return data.ts;
     }
   } catch (e) {}
+  if (process.env.WEEKLY_THREAD_TS) return process.env.WEEKLY_THREAD_TS;
   return null;
 }
 
@@ -242,6 +242,7 @@ const MANUAL_TEXT = `📖 *당번봇 매뉴얼*
 \`/당번취소 06.04\` — 해당 날짜 전체 취소
 \`/당번요청 06.04 파인트\` — 파인트 교체 요청
 \`/당번주간\` — 이번 주 일정 나만 보기
+\`/당번다음주\` — 다음 주 일정 나만 보기
 \`/당번날짜 06.04\` — 특정 날짜 당번 조회
 \`/당번매뉴얼\` — 이 매뉴얼 보기
 
@@ -251,6 +252,7 @@ const MANUAL_TEXT = `📖 *당번봇 매뉴얼*
 \`@당번봇 취소 06.04 파인트\`
 \`@당번봇 요청 06.04 파인트\`
 \`@당번봇 주간\`
+\`@당번봇 다음주\`
 \`@당번봇 날짜 06.04\`
 \`@당번봇 매뉴얼\`
 
@@ -363,8 +365,17 @@ app.command('/당번취소', async ({ command, ack, respond }) => {
 });
 
 // ─── /당번주간 ────────────────────────────────────────
-app.command('/당번주간', async ({ ack, respond }) => {
+app.command('/당번주간', async ({ command, ack, respond }) => {
   await ack();
+  const arg = command.text.trim();
+  if (arg === '다음주') {
+    const d = new Date(todayStr());
+    d.setDate(d.getDate() + 7);
+    const nextWeek = d.toLocaleDateString('sv-SE');
+    const label = getWeekLabel(nextWeek);
+    await respond({ text: `📅 *${label} 당번 일정*\n${weeklyMessage(nextWeek)}`, response_type: 'ephemeral' });
+    return;
+  }
   const today = todayStr();
   const label = getWeekLabel(today);
   await respond({ text: `📅 *${label} 당번 일정*\n${weeklyMessage(today)}`, response_type: 'ephemeral' });
@@ -392,6 +403,17 @@ app.command('/당번날짜', async ({ command, ack, respond }) => {
     text = `📅 *${dateLabel(date)}*\n\n📍 파인트: ${pintLine}\n📍 스틱바: ${stickLine}`;
   }
   await respond({ text, response_type: 'ephemeral' });
+});
+
+// ─── /당번다음주 ─────────────────────────────────────
+app.command('/당번다음주', async ({ ack, respond }) => {
+  await ack();
+  const today = todayStr();
+  const d = new Date(today);
+  d.setDate(d.getDate() + 7);
+  const nextWeek = d.toLocaleDateString('sv-SE');
+  const label = getWeekLabel(nextWeek);
+  await respond({ text: `📅 *${label} 당번 일정*\n${weeklyMessage(nextWeek)}`, response_type: 'ephemeral' });
 });
 
 // ─── /당번요청 ────────────────────────────────────────
@@ -469,6 +491,18 @@ cron.schedule(CONFIG.weeklyTime, async () => {
   });
   weeklyThreadTs = res.ts;
   saveThreadTs(res.ts);
+  // Railway 환경변수 업데이트 시도 (실패해도 파일로 유지)
+  try {
+    const railwayToken = process.env.RAILWAY_API_TOKEN;
+    const serviceId = process.env.RAILWAY_SERVICE_ID;
+    if (railwayToken && serviceId) {
+      await fetch('https://backboard.railway.app/graphql/v2', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${railwayToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: `mutation { variableUpsert(input: { serviceId: "${serviceId}", environmentId: "${process.env.RAILWAY_ENVIRONMENT_ID}", name: "WEEKLY_THREAD_TS", value: "${res.ts}" }) }` }),
+      });
+    }
+  } catch (e) {}
 }, { timezone: 'Asia/Seoul' });
 
 // ─── 매일 07:30 — 오늘 당번 알림 + 태그 ─────────────
@@ -512,14 +546,15 @@ app.event('app_mention', async ({ event, client, say }) => {
   }
 
   // 주간
-  if (cmd === '주간') {
+  if (cmd === '당번주간') {
     const today = todayStr();
     const label = getWeekLabel(today);
     await reply(`📅 *${label} 당번 일정*\n${weeklyMessage(today)}`); return;
   }
 
+
   // 날짜
-  if (cmd === '날짜') {
+  if (cmd === '당번날짜') {
     const rawDate = parts[1];
     const date = parseDate(rawDate);
     if (!date) { await reply('❌ 날짜 형식: `06.04`'); return; }
@@ -540,8 +575,8 @@ app.event('app_mention', async ({ event, client, say }) => {
   }
 
   // 변경
-  if (cmd === '변경') {
-    if (parts.length !== 4) { await reply('❌ 사용법:\n• `@당번봇 변경 06.04 파인트 박지연`\n• `@당번봇 변경 06.04 파인트 박지연(이석영)`'); return; }
+  if (cmd === '당번변경') {
+    if (parts.length !== 4) { await reply('❌ 사용법:\n• `@당번봇 당번변경 06.04 파인트 박지연`\n• `@당번봇 당번변경 06.04 파인트 박지연(이석영)`'); return; }
     const [, rawDate, loop, nameInput] = parts;
     const date = parseDate(rawDate);
     if (!date) { await reply('❌ 날짜 형식: `06.04`'); return; }
@@ -567,7 +602,7 @@ app.event('app_mention', async ({ event, client, say }) => {
   }
 
   // 취소
-  if (cmd === '취소') {
+  if (cmd === '당번취소') {
     const rawDate = parts[1];
     const loop = parts[2] || null;
     const date = parseDate(rawDate);
@@ -591,7 +626,7 @@ app.event('app_mention', async ({ event, client, say }) => {
   }
 
   // 요청
-  if (cmd === '요청') {
+  if (cmd === '당번요청') {
     const rawDate = parts[1];
     const loop = parts[2] || null;
     const date = parseDate(rawDate);
@@ -617,7 +652,7 @@ app.event('app_mention', async ({ event, client, say }) => {
     return;
   }
 
-  await reply(`❓ 모르는 명령어예요. \`@당번봇 매뉴얼\` 로 사용법을 확인해주세요!`);
+  await reply(`❓ 모르는 명령어예요. \`@당번봇 당번매뉴얼\` 로 사용법을 확인해주세요!`);
 });
 
 // ─── 서버 시작 ────────────────────────────────────────
