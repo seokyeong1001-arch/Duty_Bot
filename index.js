@@ -25,6 +25,34 @@ function saveThreadTs(ts) {
   }
 }
 
+async function updateRailwayVar(name, value) {
+  const token       = process.env.RAILWAY_API_TOKEN;
+  const projectId   = process.env.RAILWAY_PROJECT_ID;     // Railway 자동 주입
+  const environmentId = process.env.RAILWAY_ENVIRONMENT_ID; // Railway 자동 주입
+  const serviceId   = process.env.RAILWAY_SERVICE_ID;     // Railway 자동 주입
+  if (!token || !projectId || !environmentId || !serviceId) return;
+
+  const res = await fetch('https://backboard.railway.app/graphql/v2', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      query: `
+        mutation VariableUpsert($input: VariableUpsertInput!) {
+          variableUpsert(input: $input)
+        }
+      `,
+      variables: {
+        input: { projectId, environmentId, serviceId, name, value },
+      },
+    }),
+  });
+  const json = await res.json();
+  if (json.errors) throw new Error(json.errors[0].message);
+}
+
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
   signingSecret: process.env.SLACK_SIGNING_SECRET,
@@ -519,18 +547,12 @@ cron.schedule(CONFIG.weeklyTime, async () => {
   });
   weeklyThreadTs = res.ts;
   saveThreadTs(res.ts);
-  // Railway 환경변수 업데이트 시도 (실패해도 파일로 유지)
+  // Railway 환경변수 업데이트 시도 (실패해도 /tmp 파일로 유지)
   try {
-    const railwayToken = process.env.RAILWAY_API_TOKEN;
-    const serviceId = process.env.RAILWAY_SERVICE_ID;
-    if (railwayToken && serviceId) {
-      await fetch('https://backboard.railway.app/graphql/v2', {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${railwayToken}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query: `mutation { variableUpsert(input: { serviceId: "${serviceId}", environmentId: "${process.env.RAILWAY_ENVIRONMENT_ID}", name: "WEEKLY_THREAD_TS", value: "${res.ts}" }) }` }),
-      });
-    }
-  } catch (e) {}
+    await updateRailwayVar('WEEKLY_THREAD_TS', res.ts);
+  } catch (e) {
+    console.error('Railway 환경변수 업데이트 실패:', e.message);
+  }
 }, { timezone: 'Asia/Seoul' });
 
 // ─── 매일 07:30 — 오늘 당번 알림 + 태그 ─────────────
