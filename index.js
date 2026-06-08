@@ -35,7 +35,7 @@ const CONFIG = {
   startDate: '2026-06-01', // 파인트/스틱바 2루프 시작일
   notifyChannel: process.env.SLACK_CHANNEL,
   notifyTime: '30 7 * * *',
-  weeklyTime: '30 7 * * 1',
+  weeklyTime: '0 7 * * 1',
   eveningNotifyTime: '0 18 * * *',
 
   // 파인트 루프: 고가영 ↔ 박지연 하루씩 교대
@@ -322,6 +322,7 @@ async function ensureWeeklyThread() {
     text: `📅 *${weekLabel} 당번 일정*\n\n${weeklyMessage(today)}`,
   });
   weeklyThreadTs = res.ts;
+  saveThreadTs(res.ts);
 }
 
 // ─── /당번변경 ────────────────────────────────────────
