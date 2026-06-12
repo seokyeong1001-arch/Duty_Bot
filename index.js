@@ -1,43 +1,52 @@
 const { App } = require('@slack/bolt');
 const cron = require('node-cron');
-const fs = require('fs');
-const path = require('path');
 
-const THREAD_TS_FILE = path.join('/tmp', 'weekly_thread_ts.json');
-
-function loadThreadTs() {
-  // 파일 우선 (최신 스레드), 없으면 환경변수 초기값
-  try {
-    if (fs.existsSync(THREAD_TS_FILE)) {
-      const data = JSON.parse(fs.readFileSync(THREAD_TS_FILE, 'utf8'));
-      if (data.ts) return data.ts;
-    }
-  } catch (e) {}
-  if (process.env.WEEKLY_THREAD_TS) return process.env.WEEKLY_THREAD_TS;
-  return null;
+function railwayHeaders() {
+  return {
+    'Authorization': `Bearer ${process.env.RAILWAY_API_TOKEN}`,
+    'Content-Type': 'application/json',
+  };
 }
 
-function saveThreadTs(ts) {
-  try {
-    fs.writeFileSync(THREAD_TS_FILE, JSON.stringify({ ts }), 'utf8');
-  } catch (e) {
-    console.error('스레드 ts 저장 실패:', e.message);
-  }
+function railwayIds() {
+  return {
+    projectId: process.env.RAILWAY_PROJECT_ID,
+    environmentId: process.env.RAILWAY_ENVIRONMENT_ID,
+    serviceId: process.env.RAILWAY_SERVICE_ID,
+  };
 }
 
-async function updateRailwayVar(name, value) {
-  const token       = process.env.RAILWAY_API_TOKEN;
-  const projectId   = process.env.RAILWAY_PROJECT_ID;     // Railway 자동 주입
-  const environmentId = process.env.RAILWAY_ENVIRONMENT_ID; // Railway 자동 주입
-  const serviceId   = process.env.RAILWAY_SERVICE_ID;     // Railway 자동 주입
-  if (!token || !projectId || !environmentId || !serviceId) return;
+function hasRailwayCreds() {
+  const { projectId, environmentId, serviceId } = railwayIds();
+  return !!(process.env.RAILWAY_API_TOKEN && projectId && environmentId && serviceId);
+}
 
+async function getThreadTs() {
+  if (!hasRailwayCreds()) return null;
+  const { projectId, environmentId, serviceId } = railwayIds();
   const res = await fetch('https://backboard.railway.app/graphql/v2', {
     method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
+    headers: railwayHeaders(),
+    body: JSON.stringify({
+      query: `
+        query Variables($projectId: String!, $environmentId: String!, $serviceId: String!) {
+          variables(projectId: $projectId, environmentId: $environmentId, serviceId: $serviceId)
+        }
+      `,
+      variables: { projectId, environmentId, serviceId },
+    }),
+  });
+  const json = await res.json();
+  if (json.errors) throw new Error(json.errors[0].message);
+  return json.data.variables?.WEEKLY_THREAD_TS || null;
+}
+
+async function setThreadTs(ts) {
+  if (!hasRailwayCreds()) return;
+  const { projectId, environmentId, serviceId } = railwayIds();
+  const res = await fetch('https://backboard.railway.app/graphql/v2', {
+    method: 'POST',
+    headers: railwayHeaders(),
     body: JSON.stringify({
       query: `
         mutation VariableUpsert($input: VariableUpsertInput!) {
@@ -45,7 +54,7 @@ async function updateRailwayVar(name, value) {
         }
       `,
       variables: {
-        input: { projectId, environmentId, serviceId, name, value },
+        input: { projectId, environmentId, serviceId, name: 'WEEKLY_THREAD_TS', value: ts },
       },
     }),
   });
@@ -93,8 +102,7 @@ const CONFIG = {
 // ─────────────────────────────────────────────────────
 
 const overrides = {};
-let botUserId = null; // { 'YYYY-MM-DD:pint': '이름', 'YYYY-MM-DD:stick': '이름' }
-let weeklyThreadTs = loadThreadTs();
+let botUserId = null;
 
 function getWeekLabel(dateStr) {
   const d = new Date(dateStr);
@@ -319,11 +327,10 @@ const MANUAL_TEXT = `📖 *당번봇 매뉴얼*
 
 // 주간 스레드 원본 메시지 업데이트
 async function updateWeeklyThread() {
-  if (!weeklyThreadTs) return;
   try {
-    const today = todayStr();
-    // 스레드 시작일 기준으로 그 주 월요일 찾기
-    const threadDate = new Date(parseFloat(weeklyThreadTs) * 1000);
+    const ts = await getThreadTs();
+    if (!ts) return;
+    const threadDate = new Date(parseFloat(ts) * 1000);
     const threadDateStr = threadDate.toLocaleDateString('sv-SE', { timeZone: 'Asia/Seoul' });
     const d = new Date(threadDateStr);
     const dow = d.getDay();
@@ -333,7 +340,7 @@ async function updateWeeklyThread() {
     const weekLabel = getWeekLabel(mondayStr);
     await app.client.chat.update({
       channel: CONFIG.notifyChannel,
-      ts: weeklyThreadTs,
+      ts,
       text: `📅 *${weekLabel} 당번 일정*\n\n${weeklyMessage(mondayStr)}`,
     });
   } catch (e) {
@@ -341,16 +348,18 @@ async function updateWeeklyThread() {
   }
 }
 
+// ts를 반환한다 (기존 스레드 또는 새로 생성)
 async function ensureWeeklyThread() {
-  if (weeklyThreadTs) return;
+  const ts = await getThreadTs();
+  if (ts) return ts;
   const today = todayStr();
   const weekLabel = getWeekLabel(today);
   const res = await app.client.chat.postMessage({
     channel: CONFIG.notifyChannel,
     text: `📅 *${weekLabel} 당번 일정*\n\n${weeklyMessage(today)}`,
   });
-  weeklyThreadTs = res.ts;
-  saveThreadTs(res.ts);
+  await setThreadTs(res.ts);
+  return res.ts;
 }
 
 // ─── /당번변경 ────────────────────────────────────────
@@ -548,11 +557,8 @@ cron.schedule(CONFIG.weeklyTime, async () => {
     channel: CONFIG.notifyChannel,
     text: `📅 *${weekLabel} 당번 일정*\n\n${weeklyMessage(today)}`,
   });
-  weeklyThreadTs = res.ts;
-  saveThreadTs(res.ts);
-  // Railway 환경변수 업데이트 시도 (실패해도 /tmp 파일로 유지)
   try {
-    await updateRailwayVar('WEEKLY_THREAD_TS', res.ts);
+    await setThreadTs(res.ts);
   } catch (e) {
     console.error('Railway 환경변수 업데이트 실패:', e.message);
   }
@@ -561,10 +567,10 @@ cron.schedule(CONFIG.weeklyTime, async () => {
 // ─── 매일 07:30 — 오늘 당번 알림 + 태그 ─────────────
 cron.schedule(CONFIG.notifyTime, async () => {
   const today = todayStr();
-  await ensureWeeklyThread();
+  const ts = await ensureWeeklyThread();
   await app.client.chat.postMessage({
     channel: CONFIG.notifyChannel,
-    thread_ts: weeklyThreadTs,
+    thread_ts: ts,
     text: dutyMessage(today, true),
   });
 }, { timezone: 'Asia/Seoul' });
@@ -574,10 +580,10 @@ cron.schedule(CONFIG.eveningNotifyTime, async () => {
   const tomorrow = new Date();
   tomorrow.setDate(tomorrow.getDate() + 1);
   const tomorrowStr = tomorrow.toLocaleDateString('sv-SE', { timeZone: 'Asia/Seoul' });
-  await ensureWeeklyThread();
+  const ts = await ensureWeeklyThread();
   await app.client.chat.postMessage({
     channel: CONFIG.notifyChannel,
-    thread_ts: weeklyThreadTs,
+    thread_ts: ts,
     text: eveningMessage(tomorrowStr, true),
   });
 }, { timezone: 'Asia/Seoul' });
