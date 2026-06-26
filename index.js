@@ -102,10 +102,6 @@ function parseCSV(text) {
 }
 
 // ─── 시트 캐시 ────────────────────────────────────────
-// members: { 이름: 슬랙ID }
-// loop: [{ main, needCheck }]  — 루프 탭 행 순서대로
-// checkLoop: [{ check }]       — 크첵루프 탭 행 순서대로
-// startDate: 'YYYY-MM-DD'      — 루프 탭 첫 행의 시작일
 let sheetCache = { members: {}, loop: [], checkLoop: [], startDate: '' };
 
 async function loadSheets() {
@@ -159,6 +155,7 @@ const CONFIG = {
 };
 
 const overrides = {};
+const leaves = {}; // { '이름': Set<'YYYY-MM-DD'> }
 let botUserId = null;
 
 // ─── 날짜 유틸 ────────────────────────────────────────
@@ -166,11 +163,37 @@ function todayStr() {
   return new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Seoul' });
 }
 
+function seoulYear() {
+  return new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Seoul' }).slice(0, 4);
+}
+
 function parseDate(input) {
-  const year = new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Seoul' }).slice(0, 4);
   const match = input.match(/^(\d{1,2})\.(\d{1,2})$/);
   if (!match) return null;
-  return `${year}-${match[1].padStart(2, '0')}-${match[2].padStart(2, '0')}`;
+  return `${seoulYear()}-${match[1].padStart(2, '0')}-${match[2].padStart(2, '0')}`;
+}
+
+// '07.14~07.16' 또는 '07.14' → ['YYYY-MM-DD', ...]
+function parseDateRange(rangeStr) {
+  const year = seoulYear();
+  const rangeMatch = rangeStr.match(/^(\d{1,2})\.(\d{1,2})~(\d{1,2})\.(\d{1,2})$/);
+  if (rangeMatch) {
+    const [, m1, d1, m2, d2] = rangeMatch;
+    const start = new Date(`${year}-${m1.padStart(2, '0')}-${d1.padStart(2, '0')}`);
+    const end   = new Date(`${year}-${m2.padStart(2, '0')}-${d2.padStart(2, '0')}`);
+    if (isNaN(start) || isNaN(end) || start > end) return null;
+    const dates = [];
+    for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+      dates.push(d.toLocaleDateString('sv-SE'));
+    }
+    return dates;
+  }
+  const singleMatch = rangeStr.match(/^(\d{1,2})\.(\d{1,2})$/);
+  if (singleMatch) {
+    const [, mm, dd] = singleMatch;
+    return [`${year}-${mm.padStart(2, '0')}-${dd.padStart(2, '0')}`];
+  }
+  return null;
 }
 
 function dateLabel(dateStr) {
@@ -197,7 +220,37 @@ async function getRealName(client, userId) {
   }
 }
 
+// ─── 연차 유틸 ────────────────────────────────────────
+function isOnLeave(name, dateStr) {
+  return !!(name && leaves[name] && leaves[name].has(dateStr));
+}
+
+function addLeave(name, dates) {
+  if (!leaves[name]) leaves[name] = new Set();
+  for (const d of dates) leaves[name].add(d);
+}
+
+function removeLeave(name, dates) {
+  if (!leaves[name]) return 0;
+  let count = 0;
+  for (const d of dates) { if (leaves[name].delete(d)) count++; }
+  if (leaves[name].size === 0) delete leaves[name];
+  return count;
+}
+
+function leaveListText() {
+  const names = Object.keys(leaves).filter(n => leaves[n].size > 0);
+  if (!names.length) return 'ℹ️ 등록된 연차가 없어요.';
+  const lines = names.map(name => {
+    const sorted = [...leaves[name]].sort();
+    const dates = sorted.map(dateLabel).join(', ');
+    return `• *${name}*: ${dates}`;
+  });
+  return `📋 *등록된 연차 목록*\n\n${lines.join('\n')}`;
+}
+
 // ─── 당번 계산 ────────────────────────────────────────
+// 반환: { name: string|null, isSubstitute: boolean }
 function dayDiff(dateStr) {
   const start = new Date(sheetCache.startDate);
   const target = new Date(dateStr);
@@ -205,29 +258,50 @@ function dayDiff(dateStr) {
 }
 
 function getMain(dateStr) {
-  if (`${dateStr}:main` in overrides) return overrides[`${dateStr}:main`] || null;
+  if (`${dateStr}:main` in overrides) {
+    return { name: overrides[`${dateStr}:main`] || null, isSubstitute: false };
+  }
   const { loop, startDate } = sheetCache;
-  if (!startDate || !loop.length) return null;
+  if (!startDate || !loop.length) return { name: null, isSubstitute: false };
   const diff = dayDiff(dateStr);
-  if (diff < 0) return null;
-  return loop[diff % loop.length].main || null;
+  if (diff < 0) return { name: null, isSubstitute: false };
+
+  const baseIdx = diff % loop.length;
+  for (let i = 0; i < loop.length; i++) {
+    const name = loop[(baseIdx + i) % loop.length].main;
+    if (!isOnLeave(name, dateStr)) {
+      return { name: name || null, isSubstitute: i > 0 };
+    }
+  }
+  return { name: null, isSubstitute: false };
 }
 
-// 크첵 계산:
-// 전체 루프에서 크첵필요=O가 몇 번째로 나왔는지(1-based) % 크첵루프길이 → 크첵 결정
+// 크첵 계산 — needCheck 위치는 루프 순서 그대로 유지, 담당자만 연차 건너뜀
 function getCheck(dateStr) {
-  if (`${dateStr}:check` in overrides) return overrides[`${dateStr}:check`] || null;
+  if (`${dateStr}:check` in overrides) {
+    return { name: overrides[`${dateStr}:check`] || null, isSubstitute: false };
+  }
   const { loop, checkLoop, startDate } = sheetCache;
-  if (!startDate || !loop.length || !checkLoop.length) return null;
+  if (!startDate || !loop.length || !checkLoop.length) return { name: null, isSubstitute: false };
   const diff = dayDiff(dateStr);
-  if (diff < 0) return null;
+  if (diff < 0) return { name: null, isSubstitute: false };
+
   const idx = diff % loop.length;
-  if (!loop[idx].needCheck) return null;
+  if (!loop[idx].needCheck) return { name: null, isSubstitute: false };
+
   const numCheckPerCycle = loop.filter(r => r.needCheck).length;
   const fullCycles = Math.floor(diff / loop.length);
   const checksUpToIdx = loop.slice(0, idx + 1).filter(r => r.needCheck).length;
   const totalCheckCount = fullCycles * numCheckPerCycle + checksUpToIdx;
-  return checkLoop[(totalCheckCount - 1) % checkLoop.length].check || null;
+  const baseCheckIdx = (totalCheckCount - 1) % checkLoop.length;
+
+  for (let i = 0; i < checkLoop.length; i++) {
+    const name = checkLoop[(baseCheckIdx + i) % checkLoop.length].check;
+    if (!isOnLeave(name, dateStr)) {
+      return { name: name || null, isSubstitute: i > 0 };
+    }
+  }
+  return { name: null, isSubstitute: false };
 }
 
 function mentionTag(name) {
@@ -236,28 +310,30 @@ function mentionTag(name) {
 }
 
 // ─── 메시지 포맷 ──────────────────────────────────────
-function formatDutyLine(main, check, withTag) {
-  const mainText = withTag ? mentionTag(main) : `*${main}*`;
-  if (check && check !== 'NONE') {
-    const checkText = withTag ? mentionTag(check) : `*${check}*`;
-    return `${mainText} (${checkText})`;
+function formatDutyLine(mainName, checkName, withTag, mainSub = false, checkSub = false) {
+  const mainText = withTag ? mentionTag(mainName) : `*${mainName}*`;
+  const mainFull = mainSub ? `${mainText} (연차 대체)` : mainText;
+  if (checkName && checkName !== 'NONE') {
+    const checkText = withTag ? mentionTag(checkName) : `*${checkName}*`;
+    const checkFull = checkSub ? `${checkText} (연차 대체)` : checkText;
+    return `${mainFull} (${checkFull})`;
   }
-  return mainText;
+  return mainFull;
 }
 
 function dutyMessage(dateStr, withTag = false) {
   const label = dateLabel(dateStr);
-  const main = getMain(dateStr);
-  const check = getCheck(dateStr);
-  const line = main ? formatDutyLine(main, check, withTag) : '—';
+  const { name: main, isSubstitute: mainSub } = getMain(dateStr);
+  const { name: check, isSubstitute: checkSub } = getCheck(dateStr);
+  const line = main ? formatDutyLine(main, check, withTag, mainSub, checkSub) : '—';
   return `🔔 *[당번 알림]* ${label}\n\n오늘 당번은 ${line} 님입니다! 수고해주세요 💪`;
 }
 
 function eveningMessage(tomorrowStr, withTag = false) {
   const label = dateLabel(tomorrowStr);
-  const main = getMain(tomorrowStr);
-  const check = getCheck(tomorrowStr);
-  const line = main ? formatDutyLine(main, check, withTag) : '—';
+  const { name: main, isSubstitute: mainSub } = getMain(tomorrowStr);
+  const { name: check, isSubstitute: checkSub } = getCheck(tomorrowStr);
+  const line = main ? formatDutyLine(main, check, withTag, mainSub, checkSub) : '—';
   return `🌙 *[내일 당번 예고]* ${label}\n\n내일 당번은 ${line} 님입니다!`;
 }
 
@@ -270,9 +346,17 @@ function weeklyMessage(fromDateStr) {
     const ds = d.toLocaleDateString('sv-SE');
     const [, mm, dd] = ds.split('-');
     const day = dayNames[d.getDay()];
-    const main = getMain(ds) || '—';
-    const check = getCheck(ds);
-    const dutyLine = (check && check !== 'NONE') ? `${main} (${check})` : main;
+    const { name: main, isSubstitute: mainSub } = getMain(ds);
+    const { name: check, isSubstitute: checkSub } = getCheck(ds);
+    const mainStr = main || '—';
+    const mainLabel = mainSub ? `${mainStr}(연차 대체)` : mainStr;
+    let dutyLine;
+    if (check && check !== 'NONE') {
+      const checkLabel = checkSub ? `${check}(연차 대체)` : check;
+      dutyLine = `${mainLabel} (${checkLabel})`;
+    } else {
+      dutyLine = mainLabel;
+    }
     lines.push(`• ${mm}/${dd} (${day})  ${dutyLine}`);
   }
   return lines.join('\n');
@@ -333,6 +417,15 @@ const MANUAL_TEXT = `📖 *당번봇 매뉴얼*
 \`/당번요청 06.04\`
 → 교체 요청
 
+\`/당번연차 문선정 07.14~07.16\`
+→ 연차 등록 (단일 날짜: \`07.14\`)
+
+\`/당번연차취소 문선정 07.14~07.16\`
+→ 연차 취소
+
+\`/당번연차확인\`
+→ 등록된 연차 목록 보기
+
 \`/당번주간\`
 → 이번 주 일정 나만 보기
 
@@ -353,10 +446,14 @@ const MANUAL_TEXT = `📖 *당번봇 매뉴얼*
 \`@당번봇 당번변경 06.04 박지연(이석영)\`
 \`@당번봇 당번취소 06.04\`
 \`@당번봇 당번요청 06.04\`
+\`@당번봇 당번연차 문선정 07.14~07.16\`
+\`@당번봇 당번연차취소 문선정 07.14~07.16\`
+\`@당번봇 당번연차확인\`
 \`@당번봇 당번주간\`
 \`@당번봇 당번주간 다음주\`
 \`@당번봇 당번날짜 06.04\`
 \`@당번봇 당번매뉴얼\`
+\`@당번봇 당번캐시갱신\`
 
 ---
 
@@ -364,7 +461,24 @@ const MANUAL_TEXT = `📖 *당번봇 매뉴얼*
 
 • 매일 07:30 — 오늘 당번 알림 (당번자 태그)
 • 매일 18:00 — 내일 당번 예고 (당번자 태그)
-• 매주 월요일 07:00 — 주간 스레드 생성`;
+• 매주 월요일 07:00 — 주간 스레드 생성
+
+---
+
+🏖️ *연차 처리*
+
+연차 등록 시 해당 날짜의 메인/크첵 당번에서 자동으로 다음 순번으로 대체되며,
+알림 메시지에 *(연차 대체)* 표시가 붙어요.`;
+
+// ─── 연차 슬래시 커맨드 공통 파서 ────────────────────
+function parseLeaveArgs(text) {
+  const parts = text.trim().split(/\s+/);
+  if (parts.length !== 2) return null;
+  const [name, rangeStr] = parts;
+  const dates = parseDateRange(rangeStr);
+  if (!dates) return null;
+  return { name, dates, rangeStr };
+}
 
 // ─── /당번변경 ────────────────────────────────────────
 app.command('/당번변경', async ({ command, ack, respond }) => {
@@ -431,10 +545,10 @@ app.command('/당번날짜', async ({ command, ack, respond }) => {
   await ack();
   const date = parseDate(command.text.trim());
   if (!date) { await respond({ text: '❌ 날짜 형식: `06.04`', response_type: 'ephemeral' }); return; }
-  const main = getMain(date) || '—';
-  const check = getCheck(date);
-  const line = (check && check !== 'NONE') ? `${main} (${check})` : main;
-  await respond({ text: `📅 *${dateLabel(date)}* 당번: *${line}* 님`, response_type: 'ephemeral' });
+  const { name: main, isSubstitute: mainSub } = getMain(date);
+  const { name: check, isSubstitute: checkSub } = getCheck(date);
+  const line = main ? formatDutyLine(main, check, false, mainSub, checkSub) : '—';
+  await respond({ text: `📅 *${dateLabel(date)}* 당번: ${line} 님`, response_type: 'ephemeral' });
 });
 
 // ─── /당번다음주 ─────────────────────────────────────
@@ -468,6 +582,46 @@ app.command('/당번요청', async ({ command, ack, client, respond }) => {
   await respond({ text: `📨 *${label}* 교체 요청을 채널에 보냈어요.`, response_type: 'ephemeral' });
 });
 
+// ─── /당번연차 ────────────────────────────────────────
+app.command('/당번연차', async ({ command, ack, respond }) => {
+  await ack();
+  const parsed = parseLeaveArgs(command.text);
+  if (!parsed) {
+    await respond({ text: '❌ 사용법: `/당번연차 문선정 07.14~07.16`', response_type: 'ephemeral' }); return;
+  }
+  const { name, dates, rangeStr } = parsed;
+  addLeave(name, dates);
+  await respond({ text: `🏖️ *${name}* 님 연차 등록 완료 (${rangeStr}, ${dates.length}일)`, response_type: 'in_channel' });
+});
+
+// ─── /당번연차취소 ────────────────────────────────────
+app.command('/당번연차취소', async ({ command, ack, respond }) => {
+  await ack();
+  const parsed = parseLeaveArgs(command.text);
+  if (!parsed) {
+    await respond({ text: '❌ 사용법: `/당번연차취소 문선정 07.14~07.16`', response_type: 'ephemeral' }); return;
+  }
+  const { name, dates, rangeStr } = parsed;
+  const removed = removeLeave(name, dates);
+  if (removed > 0) {
+    await respond({ text: `↩️ *${name}* 님 연차 취소 완료 (${rangeStr}, ${removed}일)`, response_type: 'in_channel' });
+  } else {
+    await respond({ text: `ℹ️ *${name}* 님의 해당 날짜 연차가 없어요.`, response_type: 'ephemeral' });
+  }
+});
+
+// ─── /당번연차확인 ────────────────────────────────────
+app.command('/당번연차확인', async ({ ack, respond }) => {
+  await ack();
+  await respond({ text: leaveListText(), response_type: 'ephemeral' });
+});
+
+// ─── /당번매뉴얼 ──────────────────────────────────────
+app.command('/당번매뉴얼', async ({ ack, respond }) => {
+  await ack();
+  await respond({ text: MANUAL_TEXT, response_type: 'ephemeral' });
+});
+
 // ─── 수락 버튼 ────────────────────────────────────────
 app.action('duty_accept', async ({ body, ack, client }) => {
   await ack();
@@ -489,12 +643,6 @@ app.action('duty_decline', async ({ body, ack, client }) => {
   const decliner = await getRealName(app.client, body.user.id);
   const label = dateLabel(date);
   await client.chat.postMessage({ channel: body.channel.id, thread_ts: body.message.ts, text: `*${decliner}* 님이 *${label}* 교체 요청을 거절했어요.` });
-});
-
-// ─── /당번매뉴얼 ──────────────────────────────────────
-app.command('/당번매뉴얼', async ({ ack, respond }) => {
-  await ack();
-  await respond({ text: MANUAL_TEXT, response_type: 'ephemeral' });
 });
 
 // ─── 매주 월요일 07:00 — 새 주간 스레드 생성 ──────────
@@ -556,6 +704,33 @@ app.event('app_mention', async ({ event, client, say }) => {
     return;
   }
 
+  if (cmd === '당번연차') {
+    // @당번봇 당번연차 문선정 07.14~07.16
+    const parsed = parts.length === 3 ? parseLeaveArgs(`${parts[1]} ${parts[2]}`) : null;
+    if (!parsed) { await reply('❌ 사용법: `@당번봇 당번연차 문선정 07.14~07.16`'); return; }
+    const { name, dates, rangeStr } = parsed;
+    addLeave(name, dates);
+    await reply(`🏖️ *${name}* 님 연차 등록 완료 (${rangeStr}, ${dates.length}일)`);
+    return;
+  }
+
+  if (cmd === '당번연차취소') {
+    const parsed = parts.length === 3 ? parseLeaveArgs(`${parts[1]} ${parts[2]}`) : null;
+    if (!parsed) { await reply('❌ 사용법: `@당번봇 당번연차취소 문선정 07.14~07.16`'); return; }
+    const { name, dates, rangeStr } = parsed;
+    const removed = removeLeave(name, dates);
+    if (removed > 0) {
+      await reply(`↩️ *${name}* 님 연차 취소 완료 (${rangeStr}, ${removed}일)`);
+    } else {
+      await reply(`ℹ️ *${name}* 님의 해당 날짜 연차가 없어요.`);
+    }
+    return;
+  }
+
+  if (cmd === '당번연차확인') {
+    await reply(leaveListText()); return;
+  }
+
   if (cmd === '당번주간') {
     if (parts[1] === '다음주') {
       const d = new Date(todayStr());
@@ -570,10 +745,10 @@ app.event('app_mention', async ({ event, client, say }) => {
   if (cmd === '당번날짜') {
     const date = parseDate(parts[1] || '');
     if (!date) { await reply('❌ 날짜 형식: `06.04`'); return; }
-    const main = getMain(date) || '—';
-    const check = getCheck(date);
-    const line = (check && check !== 'NONE') ? `${main} (${check})` : main;
-    await reply(`📅 *${dateLabel(date)}* 당번: *${line}* 님`); return;
+    const { name: main, isSubstitute: mainSub } = getMain(date);
+    const { name: check, isSubstitute: checkSub } = getCheck(date);
+    const line = main ? formatDutyLine(main, check, false, mainSub, checkSub) : '—';
+    await reply(`📅 *${dateLabel(date)}* 당번: ${line} 님`); return;
   }
 
   if (cmd === '당번변경') {
