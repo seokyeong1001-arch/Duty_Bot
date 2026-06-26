@@ -310,30 +310,28 @@ function mentionTag(name) {
 }
 
 // ─── 메시지 포맷 ──────────────────────────────────────
-function formatDutyLine(mainName, checkName, withTag, mainSub = false, checkSub = false) {
+function formatDutyLine(mainName, checkName, withTag) {
   const mainText = withTag ? mentionTag(mainName) : `*${mainName}*`;
-  const mainFull = mainSub ? `${mainText} (연차 대체)` : mainText;
   if (checkName && checkName !== 'NONE') {
     const checkText = withTag ? mentionTag(checkName) : `*${checkName}*`;
-    const checkFull = checkSub ? `${checkText} (연차 대체)` : checkText;
-    return `${mainFull} (${checkFull})`;
+    return `${mainText} (${checkText})`;
   }
-  return mainFull;
+  return mainText;
 }
 
 function dutyMessage(dateStr, withTag = false) {
   const label = dateLabel(dateStr);
-  const { name: main, isSubstitute: mainSub } = getMain(dateStr);
-  const { name: check, isSubstitute: checkSub } = getCheck(dateStr);
-  const line = main ? formatDutyLine(main, check, withTag, mainSub, checkSub) : '—';
+  const { name: main } = getMain(dateStr);
+  const { name: check } = getCheck(dateStr);
+  const line = main ? formatDutyLine(main, check, withTag) : '—';
   return `🔔 *[당번 알림]* ${label}\n\n오늘 당번은 ${line} 님입니다! 수고해주세요 💪`;
 }
 
 function eveningMessage(tomorrowStr, withTag = false) {
   const label = dateLabel(tomorrowStr);
-  const { name: main, isSubstitute: mainSub } = getMain(tomorrowStr);
-  const { name: check, isSubstitute: checkSub } = getCheck(tomorrowStr);
-  const line = main ? formatDutyLine(main, check, withTag, mainSub, checkSub) : '—';
+  const { name: main } = getMain(tomorrowStr);
+  const { name: check } = getCheck(tomorrowStr);
+  const line = main ? formatDutyLine(main, check, withTag) : '—';
   return `🌙 *[내일 당번 예고]* ${label}\n\n내일 당번은 ${line} 님입니다!`;
 }
 
@@ -346,17 +344,10 @@ function weeklyMessage(fromDateStr) {
     const ds = d.toLocaleDateString('sv-SE');
     const [, mm, dd] = ds.split('-');
     const day = dayNames[d.getDay()];
-    const { name: main, isSubstitute: mainSub } = getMain(ds);
-    const { name: check, isSubstitute: checkSub } = getCheck(ds);
+    const { name: main } = getMain(ds);
+    const { name: check } = getCheck(ds);
     const mainStr = main || '—';
-    const mainLabel = mainSub ? `${mainStr}(연차 대체)` : mainStr;
-    let dutyLine;
-    if (check && check !== 'NONE') {
-      const checkLabel = checkSub ? `${check}(연차 대체)` : check;
-      dutyLine = `${mainLabel} (${checkLabel})`;
-    } else {
-      dutyLine = mainLabel;
-    }
+    const dutyLine = (check && check !== 'NONE') ? `${mainStr} (${check})` : mainStr;
     lines.push(`• ${mm}/${dd} (${day})  ${dutyLine}`);
   }
   return lines.join('\n');
@@ -545,9 +536,9 @@ app.command('/당번날짜', async ({ command, ack, respond }) => {
   await ack();
   const date = parseDate(command.text.trim());
   if (!date) { await respond({ text: '❌ 날짜 형식: `06.04`', response_type: 'ephemeral' }); return; }
-  const { name: main, isSubstitute: mainSub } = getMain(date);
-  const { name: check, isSubstitute: checkSub } = getCheck(date);
-  const line = main ? formatDutyLine(main, check, false, mainSub, checkSub) : '—';
+  const { name: main } = getMain(date);
+  const { name: check } = getCheck(date);
+  const line = main ? formatDutyLine(main, check, false) : '—';
   await respond({ text: `📅 *${dateLabel(date)}* 당번: ${line} 님`, response_type: 'ephemeral' });
 });
 
@@ -745,9 +736,9 @@ app.event('app_mention', async ({ event, client, say }) => {
   if (cmd === '당번날짜') {
     const date = parseDate(parts[1] || '');
     if (!date) { await reply('❌ 날짜 형식: `06.04`'); return; }
-    const { name: main, isSubstitute: mainSub } = getMain(date);
-    const { name: check, isSubstitute: checkSub } = getCheck(date);
-    const line = main ? formatDutyLine(main, check, false, mainSub, checkSub) : '—';
+    const { name: main } = getMain(date);
+    const { name: check } = getCheck(date);
+    const line = main ? formatDutyLine(main, check, false) : '—';
     await reply(`📅 *${dateLabel(date)}* 당번: ${line} 님`); return;
   }
 
