@@ -536,11 +536,6 @@ cron.schedule(CONFIG.eveningNotifyTime, async () => {
   });
 }, { timezone: 'Asia/Seoul' });
 
-// ─── 매일 00:00 — 시트 캐시 갱신 ─────────────────────
-cron.schedule('0 0 * * *', async () => {
-  await loadSheets();
-}, { timezone: 'Asia/Seoul' });
-
 // ─── @당번봇 멘션 처리 ────────────────────────────────
 app.event('app_mention', async ({ event, client, say }) => {
   const text = event.text.replace(/<@[A-Z0-9]+>/g, '').trim();
@@ -552,6 +547,13 @@ app.event('app_mention', async ({ event, client, say }) => {
 
   if (!cmd || cmd === '매뉴얼' || cmd === '당번매뉴얼') {
     await reply(MANUAL_TEXT); return;
+  }
+
+  if (cmd === '당번캐시갱신') {
+    await reply('🔄 시트 캐시 갱신 중...');
+    await loadSheets();
+    await reply(`✅ 캐시 갱신 완료! 멤버 ${Object.keys(sheetCache.members).length}명 / 루프 ${sheetCache.loop.length}칸 / 크첵루프 ${sheetCache.checkLoop.length}칸`);
+    return;
   }
 
   if (cmd === '당번주간') {
