@@ -715,6 +715,18 @@ function parseLeaveArgs(text) {
   return { name, dates, rangeStr };
 }
 
+// ─── 거절 랜덤 멘트 ───────────────────────────────────
+const DECLINE_LINES = [
+  (n) => `${n} 님이 이번엔 어렵대요 🥲`,
+  (n) => `${n} 님은 이번엔 패스! 다른 분은요? 🙏`,
+  (n) => `${n} 님이 손을 저었어요 🥲 다음 분!`,
+  (n) => `${n} 님은 오늘 일정이 있대요 😢 다른 분 없을까요?`,
+  (n) => `${n} 님이 고개를 젓네요 🥲`,
+];
+function randomDecline(name) {
+  return DECLINE_LINES[Math.floor(Math.random() * DECLINE_LINES.length)](name);
+}
+
 // ─── 요청 방식: 대리 요청 (채널 공지) ────────────────
 app.action('req_delegate', async ({ body, ack, client, respond }) => {
   await ack();
@@ -758,20 +770,22 @@ app.action('req_swap', async ({ body, ack, client, respond }) => {
       submit: { type: 'plain_text', text: '요청' },
       close: { type: 'plain_text', text: '취소' },
       blocks: [
-        { type: 'section', text: { type: 'mrkdwn', text: `*${dateLabel(date)}* ${roleLabel} 당번을 바꿀 날짜를 선택하세요.` } },
-        { type: 'input', block_id: 'swap_date', label: { type: 'plain_text', text: '교체할 날짜' },
-          element: { type: 'datepicker', action_id: 'picked' } },
+        { type: 'section', text: { type: 'mrkdwn', text: `*${dateLabel(date)}* ${roleLabel} 당번을 바꿀 날짜를 입력해줘요.` } },
+        { type: 'input', block_id: 'swap_date',
+          label: { type: 'plain_text', text: '교체하고 싶은 다른 날짜를 입력해줘요 (예: 07.21)' },
+          element: { type: 'plain_text_input', action_id: 'picked', placeholder: { type: 'plain_text', text: '07.21' } } },
       ],
     },
   });
-  await respond({ replace_original: true, text: '🔄 날짜 교체 요청 창을 열었어요. (창에서 날짜를 선택하세요)' });
+  await respond({ replace_original: true, text: '🔄 날짜 교체 요청 창을 열었어요. (창에서 날짜를 입력하세요)' });
 });
 
 // 날짜 교체 모달 제출 → 상대 당번에게 태그해 채널 공지
 app.view('swap_modal', async ({ body, ack, view, client }) => {
   const { date, role, channel } = JSON.parse(view.private_metadata);
-  const date2 = view.state.values['swap_date']?.['picked']?.selected_date;
-  if (!date2) { await ack({ response_action: 'errors', errors: { swap_date: '날짜를 선택해주세요.' } }); return; }
+  const raw = (view.state.values['swap_date']?.['picked']?.value || '').trim();
+  const date2 = parseDate(raw);
+  if (!date2) { await ack({ response_action: 'errors', errors: { swap_date: '날짜 형식은 MM.DD 예요 (예: 07.21)' } }); return; }
   if (date2 === date) { await ack({ response_action: 'errors', errors: { swap_date: '같은 날짜로는 교체할 수 없어요.' } }); return; }
 
   const roleLabel = role === 'check' ? '크첵' : '메인';
@@ -807,17 +821,15 @@ app.action('delegate_accept', async ({ body, ack, client }) => {
   await syncOverrideRow(date);
   await client.chat.update({
     channel: body.channel.id, ts: body.message.ts, text: `✅ 당번 교체 완료`,
-    blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `✅ *당번 교체 완료*\n\n*${dateLabel(date)}* ${roleLabel} 당번이 ${requester} 님 → *${acceptor}* 님으로 변경됐어요! 🎉` } }],
+    blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `✅ *${dateLabel(date)}* ${roleLabel} 당번이 ${acceptor} 님으로 변경됐어요. ${requester} → ${acceptor}` } }],
   });
   await updateWeeklyThread();
 });
 
 app.action('delegate_decline', async ({ body, ack, client }) => {
   await ack();
-  const { date, role } = JSON.parse(body.actions[0].value);
   const decliner = memberNameById(body.user.id) || await getRealName(app.client, body.user.id);
-  const roleLabel = role === 'check' ? '크첵' : '메인';
-  await client.chat.postMessage({ channel: body.channel.id, thread_ts: body.message.ts, text: `*${decliner}* 님이 *${dateLabel(date)}* ${roleLabel} 교체 요청을 거절했어요.` });
+  await client.chat.postMessage({ channel: body.channel.id, thread_ts: body.message.ts, text: randomDecline(decliner) });
 });
 
 // ─── 날짜 교체 수락/거절 ──────────────────────────────
@@ -831,16 +843,15 @@ app.action('swap_accept', async ({ body, ack, client }) => {
   await syncOverrideRow(date2);
   await client.chat.update({
     channel: body.channel.id, ts: body.message.ts, text: `✅ 날짜 교체 완료`,
-    blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `✅ *날짜 교체 완료*\n\n${dateLabel(date)} ${counterpart} ↔ ${dateLabel(date2)} ${requester} 로 교체됐어요! 🎉` } }],
+    blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `✅ *${dateLabel(date)}* ↔ *${dateLabel(date2)}* 교체 완료! ${requester} ↔ ${counterpart}` } }],
   });
   await updateWeeklyThread();
 });
 
 app.action('swap_decline', async ({ body, ack, client }) => {
   await ack();
-  const { date, date2 } = JSON.parse(body.actions[0].value);
   const decliner = memberNameById(body.user.id) || await getRealName(app.client, body.user.id);
-  await client.chat.postMessage({ channel: body.channel.id, thread_ts: body.message.ts, text: `*${decliner}* 님이 ${dateLabel(date)} ↔ ${dateLabel(date2)} 날짜 교체 요청을 거절했어요.` });
+  await client.chat.postMessage({ channel: body.channel.id, thread_ts: body.message.ts, text: randomDecline(decliner) });
 });
 
 // ─── 이번달 주차 선택 버튼 ────────────────────────────
