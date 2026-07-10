@@ -1,5 +1,6 @@
 const { App } = require('@slack/bolt');
 const cron = require('node-cron');
+const { google } = require('googleapis');
 
 // ─── Railway 환경변수 API ──────────────────────────────
 function railwayHeaders() {
@@ -67,6 +68,14 @@ async function setThreadTs(ts) {
 const SHEET_ID = '1AJ297G3fIa_P4qcF1vrC3aTsJNjC6baKvsmSrD1Wh_4';
 const sheetUrl = (tab) =>
   `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(tab)}`;
+
+// ─── 영구 저장 탭 ─────────────────────────────────────
+const OVERRIDE_TAB = '변경'; // 날짜 | 메인 | 크첵
+const LEAVE_TAB = '연차';    // 이름 | 시작일 | 종료일
+// 최초 탭 생성 시 이관할 기존 변경값 (메모리 → 시트 1회성 시드)
+const SEED_OVERRIDES = [
+  { date: '2026-07-14', main: '손유곤', check: '문선정' },
+];
 
 function parseLine(line) {
   const result = [];
@@ -138,6 +147,226 @@ async function loadSheets() {
     );
   } catch (e) {
     console.error('[시트 캐시] 로드 실패:', e.message);
+  }
+}
+
+// ─── Google Sheets 쓰기 (googleapis) ──────────────────
+let sheetsClient = null;
+let tabSheetIds = {}; // 탭 제목 → 숫자 sheetId
+
+function hasSheetsCreds() {
+  return !!process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+}
+
+function getSheetsClient() {
+  if (sheetsClient) return sheetsClient;
+  const creds = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+  const auth = new google.auth.GoogleAuth({
+    credentials: creds,
+    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+  });
+  sheetsClient = google.sheets({ version: 'v4', auth });
+  return sheetsClient;
+}
+
+// 여러 포맷의 날짜 문자열 → 'YYYY-MM-DD'
+function normalizeDate(str) {
+  if (!str) return null;
+  const s = String(str).trim();
+  let m = s.match(/^(\d{4})[-.\s/]+(\d{1,2})[-.\s/]+(\d{1,2})/); // 2026-07-14, 2026. 7. 14
+  if (m) return `${m[1]}-${m[2].padStart(2, '0')}-${m[3].padStart(2, '0')}`;
+  m = s.match(/^(\d{1,2})[\/.](\d{1,2})[\/.](\d{4})$/); // 7/14/2026
+  if (m) return `${m[3]}-${m[1].padStart(2, '0')}-${m[2].padStart(2, '0')}`;
+  return null;
+}
+
+function expandRange(startStr, endStr) {
+  const start = new Date(startStr);
+  const end = new Date(endStr);
+  const dates = [];
+  for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+    dates.push(d.toLocaleDateString('sv-SE'));
+  }
+  return dates;
+}
+
+// 두 탭이 없으면 생성하고 헤더/시드 보장, sheetId 매핑 저장
+async function ensureTabs() {
+  const sheets = getSheetsClient();
+  const meta = await sheets.spreadsheets.get({ spreadsheetId: SHEET_ID });
+  const bySheet = {};
+  for (const s of meta.data.sheets) bySheet[s.properties.title] = s.properties.sheetId;
+
+  const created = [];
+  const requests = [];
+  for (const title of [OVERRIDE_TAB, LEAVE_TAB]) {
+    if (!(title in bySheet)) { requests.push({ addSheet: { properties: { title } } }); created.push(title); }
+  }
+  if (requests.length) {
+    const res = await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: SHEET_ID, requestBody: { requests },
+    });
+    for (const r of res.data.replies) {
+      if (r.addSheet) bySheet[r.addSheet.properties.title] = r.addSheet.properties.sheetId;
+    }
+  }
+  tabSheetIds = bySheet;
+
+  await ensureHeader(OVERRIDE_TAB, ['날짜', '메인', '크첵']);
+  await ensureHeader(LEAVE_TAB, ['이름', '시작일', '종료일']);
+
+  // 변경 탭을 이번에 새로 만든 경우에만 기존 메모리 값 시드
+  if (created.includes(OVERRIDE_TAB) && SEED_OVERRIDES.length) {
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: SHEET_ID, range: `${OVERRIDE_TAB}!A1`,
+      valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS',
+      requestBody: { values: SEED_OVERRIDES.map(o => [o.date, o.main, o.check || '']) },
+    });
+    console.log(`[영구저장] 변경 탭 생성 + 시드 ${SEED_OVERRIDES.length}건 입력`);
+  }
+}
+
+async function ensureHeader(tab, header) {
+  const sheets = getSheetsClient();
+  const res = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${tab}!A1:C1` });
+  const row = (res.data.values && res.data.values[0]) || [];
+  if (row.join('|') !== header.join('|')) {
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: SHEET_ID, range: `${tab}!A1`, valueInputOption: 'RAW',
+      requestBody: { values: [header] },
+    });
+  }
+}
+
+// 특정 탭 날짜(A열) 기준 데이터 행 인덱스(헤더 제외, 0-based). 없으면 -1
+async function findRowIndexByDate(tab, matchDate) {
+  const sheets = getSheetsClient();
+  const res = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${tab}!A2:A` });
+  const col = res.data.values || [];
+  for (let i = 0; i < col.length; i++) {
+    if (normalizeDate(col[i][0]) === matchDate) return i;
+  }
+  return -1;
+}
+
+// 데이터 행 인덱스(헤더 제외, 0-based) 삭제
+async function deleteRow(tab, dataRowIdx) {
+  const sheets = getSheetsClient();
+  const sheetId = tabSheetIds[tab];
+  if (sheetId === undefined) return;
+  const startIndex = dataRowIdx + 1; // 헤더가 0번, 첫 데이터가 1번
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: SHEET_ID,
+    requestBody: { requests: [{ deleteDimension: {
+      range: { sheetId, dimension: 'ROWS', startIndex, endIndex: startIndex + 1 },
+    } }] },
+  });
+}
+
+// 메모리 overrides 상태를 변경 탭 한 행에 반영 (없으면 삭제)
+async function syncOverrideRow(date) {
+  if (!hasSheetsCreds()) return;
+  try {
+    const hasMain = `${date}:main` in overrides;
+    const hasCheck = `${date}:check` in overrides;
+    if (!hasMain && !hasCheck) {
+      const idx = await findRowIndexByDate(OVERRIDE_TAB, date);
+      if (idx >= 0) await deleteRow(OVERRIDE_TAB, idx);
+      return;
+    }
+    const sheets = getSheetsClient();
+    const values = [[date, overrides[`${date}:main`] || '', overrides[`${date}:check`] || '']];
+    const idx = await findRowIndexByDate(OVERRIDE_TAB, date);
+    if (idx >= 0) {
+      const rowNum = idx + 2; // +1 헤더, +1 1-based
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: SHEET_ID, range: `${OVERRIDE_TAB}!A${rowNum}:C${rowNum}`,
+        valueInputOption: 'RAW', requestBody: { values },
+      });
+    } else {
+      await sheets.spreadsheets.values.append({
+        spreadsheetId: SHEET_ID, range: `${OVERRIDE_TAB}!A1`,
+        valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS', requestBody: { values },
+      });
+    }
+  } catch (e) {
+    console.error('[영구저장] 변경 반영 실패:', e.message);
+  }
+}
+
+// 연차 탭에 [이름, 시작일, 종료일] 한 행 추가
+async function persistLeaveAdd(name, startStr, endStr) {
+  if (!hasSheetsCreds()) return;
+  try {
+    const sheets = getSheetsClient();
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: SHEET_ID, range: `${LEAVE_TAB}!A1`,
+      valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS',
+      requestBody: { values: [[name, startStr, endStr]] },
+    });
+  } catch (e) {
+    console.error('[영구저장] 연차 등록 실패:', e.message);
+  }
+}
+
+// 연차 탭에서 이름 일치 + 기간 겹치는 행 삭제
+async function persistLeaveRemove(name, startStr, endStr) {
+  if (!hasSheetsCreds()) return;
+  try {
+    const sheets = getSheetsClient();
+    const res = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${LEAVE_TAB}!A2:C` });
+    const rows = res.data.values || [];
+    const toDelete = [];
+    for (let i = 0; i < rows.length; i++) {
+      const [rName, rStart, rEnd] = rows[i];
+      if (rName !== name) continue;
+      const s = normalizeDate(rStart);
+      if (!s) continue;
+      const e = normalizeDate(rEnd) || s;
+      if (s <= endStr && e >= startStr) toDelete.push(i); // 기간 겹침
+    }
+    for (const idx of toDelete.sort((a, b) => b - a)) { // 아래 행부터 삭제
+      await deleteRow(LEAVE_TAB, idx);
+    }
+  } catch (e) {
+    console.error('[영구저장] 연차 취소 실패:', e.message);
+  }
+}
+
+// 서버 시작/캐시갱신 시 두 탭을 읽어 메모리에 로드
+async function loadPersisted() {
+  if (!hasSheetsCreds()) {
+    console.warn('[영구저장] GOOGLE_SERVICE_ACCOUNT_JSON 미설정 — 메모리 전용 모드로 동작');
+    return;
+  }
+  try {
+    await ensureTabs();
+    const sheets = getSheetsClient();
+
+    // 변경
+    for (const k of Object.keys(overrides)) delete overrides[k];
+    const ov = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${OVERRIDE_TAB}!A2:C` });
+    for (const row of (ov.data.values || [])) {
+      const date = normalizeDate(row[0]);
+      if (!date) continue;
+      if (row[1]) overrides[`${date}:main`] = row[1];
+      if (row[2]) overrides[`${date}:check`] = row[2];
+    }
+
+    // 연차
+    for (const k of Object.keys(leaves)) delete leaves[k];
+    const lv = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${LEAVE_TAB}!A2:C` });
+    for (const row of (lv.data.values || [])) {
+      const name = (row[0] || '').trim();
+      const start = normalizeDate(row[1]);
+      if (!name || !start) continue;
+      const end = normalizeDate(row[2]) || start;
+      addLeave(name, expandRange(start, end));
+    }
+
+    console.log(`[영구저장] 로드 완료 — 변경 ${Object.keys(overrides).length}건 / 연차 ${Object.keys(leaves).length}명`);
+  } catch (e) {
+    console.error('[영구저장] 로드 실패:', e.message);
   }
 }
 
@@ -476,6 +705,7 @@ app.action('duty_accept', async ({ body, ack, client }) => {
   const acceptor = await getRealName(app.client, body.user.id);
   const label = dateLabel(date);
   overrides[`${date}:main`] = acceptor;
+  await syncOverrideRow(date);
   await client.chat.update({
     channel: body.channel.id, ts: body.message.ts, text: `✅ 당번 교체 완료`,
     blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `✅ *당번 교체 완료*\n\n*${label}* 당번이 *${acceptor}* 님으로 변경됐어요!\n${requester} 님 → *${acceptor}* 님 🎉` } }],
@@ -596,7 +826,8 @@ app.event('app_mention', async ({ event, client, say }) => {
   if (cmd === '캐시갱신') {
     await reply('🔄 시트 캐시 갱신 중...');
     await loadSheets();
-    await reply(`✅ 캐시 갱신 완료! 멤버 ${Object.keys(sheetCache.members).length}명 / 루프 ${sheetCache.loop.length}칸 / 크첵루프 ${sheetCache.checkLoop.length}칸`);
+    await loadPersisted();
+    await reply(`✅ 캐시 갱신 완료! 멤버 ${Object.keys(sheetCache.members).length}명 / 루프 ${sheetCache.loop.length}칸 / 크첵루프 ${sheetCache.checkLoop.length}칸 / 변경 ${Object.keys(overrides).length ? Object.keys(overrides).filter(k => k.endsWith(':main')).length : 0}건 / 연차 ${Object.keys(leaves).length}명`);
     return;
   }
 
@@ -631,12 +862,14 @@ app.event('app_mention', async ({ event, client, say }) => {
       const [, mainName, checkName] = combinedMatch;
       overrides[`${date}:main`] = mainName;
       overrides[`${date}:check`] = checkName;
+      await syncOverrideRow(date);
       await updateWeeklyThread();
       await reply(`✅ *${dateLabel(date)}* 당번 *${mainName}* 님, 크첵 *${checkName}* 님으로 변경했어요.`);
       return;
     }
     overrides[`${date}:main`] = nameInput;
     delete overrides[`${date}:check`];
+    await syncOverrideRow(date);
     await updateWeeklyThread();
     await reply(`✅ *${dateLabel(date)}* 를 *${nameInput}* 님으로 변경했어요.`);
     return;
@@ -650,6 +883,7 @@ app.event('app_mention', async ({ event, client, say }) => {
     const removed = keys.filter(k => k in overrides);
     removed.forEach(k => delete overrides[k]);
     if (removed.length > 0) {
+      await syncOverrideRow(date);
       await updateWeeklyThread();
       await reply(`↩️ *${dateLabel(date)}* 변경을 취소했어요.`);
     } else {
@@ -686,6 +920,7 @@ app.event('app_mention', async ({ event, client, say }) => {
     if (!parsed) { await reply('❌ 사용법: `@당번봇 연차 홍길동 MM.DD~MM.DD`'); return; }
     const { name, dates, rangeStr } = parsed;
     addLeave(name, dates);
+    await persistLeaveAdd(name, dates[0], dates[dates.length - 1]);
     await reply(`🏖️ *${name}* 님 연차 등록 완료 (${rangeStr}, ${dates.length}일)`);
     return;
   }
@@ -697,6 +932,7 @@ app.event('app_mention', async ({ event, client, say }) => {
     const { name, dates, rangeStr } = parsed;
     const removed = removeLeave(name, dates);
     if (removed > 0) {
+      await persistLeaveRemove(name, dates[0], dates[dates.length - 1]);
       await reply(`↩️ *${name}* 님 연차 취소 완료 (${rangeStr}, ${removed}일)`);
     } else {
       await reply(`ℹ️ *${name}* 님의 해당 날짜 연차가 없어요.`);
@@ -724,6 +960,7 @@ app.event('app_mention', async ({ event, client, say }) => {
 // ─── 서버 시작 ────────────────────────────────────────
 (async () => {
   await loadSheets();
+  await loadPersisted();
   await app.start(process.env.PORT || 3000);
   const authResult = await app.client.auth.test();
   botUserId = authResult.user_id;
