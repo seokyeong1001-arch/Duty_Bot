@@ -432,12 +432,6 @@ function dateLabel(dateStr) {
   return `${mm}.${dd} (${dayNames[d.getDay()]})`;
 }
 
-// 'YYYY-MM-DD' → 'MM.DD'
-function shortDate(dateStr) {
-  const [, mm, dd] = dateStr.split('-');
-  return `${mm}.${dd}`;
-}
-
 function getWeekLabel(dateStr) {
   const d = new Date(dateStr);
   const month = d.getMonth() + 1;
@@ -549,6 +543,14 @@ function memberNameById(userId) {
   for (const [name, id] of Object.entries(sheetCache.members)) {
     if (id && id === userId) return name;
   }
+  return null;
+}
+
+// 해당 날짜에 name의 역할 판별: 'main' | 'check' | null (메인 우선)
+function requesterRole(dateStr, name) {
+  if (!name) return null;
+  if (name === getMain(dateStr).name) return 'main';
+  if (name === getCheck(dateStr).name) return 'check';
   return null;
 }
 
@@ -691,8 +693,9 @@ const MANUAL_TEXT = `📖 *당번봇 매뉴얼*
 \`@당번봇 취소 MM.DD\` — 변경 취소, 원래 순서로 복구
 
 🙏 *교체 요청*
-\`@당번봇 요청 MM.DD\` — 채널에 교체 요청 공지
-→ 누군가 수락하면 자동으로 당번 변경
+\`@당번봇 요청 MM.DD\` — 대리 또는 날짜 교체 요청
+→ *대리 요청*: 그날 당번을 대신해줄 사람 구하기 (수락 시 자동 변경)
+→ *날짜 교체*: 다른 날짜 당번과 서로 바꾸기 (수락 시 자동 교체)
 
 🏖️ *연차*
 \`@당번봇 연차 홍길동 MM.DD~MM.DD\` — 연차 등록
@@ -712,29 +715,132 @@ function parseLeaveArgs(text) {
   return { name, dates, rangeStr };
 }
 
-// ─── 수락 버튼 ────────────────────────────────────────
-app.action('duty_accept', async ({ body, ack, client }) => {
+// ─── 요청 방식: 대리 요청 (채널 공지) ────────────────
+app.action('req_delegate', async ({ body, ack, client, respond }) => {
+  await ack();
+  const { date, role } = JSON.parse(body.actions[0].value);
+  const requesterName = memberNameById(body.user.id) || await getRealName(app.client, body.user.id);
+  const roleLabel = role === 'check' ? '크첵' : '메인';
+
+  // 태그 대상: 메인 → 멤버 전체, 크첵 → 크첵루프 인원 (본인 제외)
+  const pool = role === 'check'
+    ? sheetCache.checkLoop.map(r => r.check)
+    : Object.keys(sheetCache.members);
+  const tagNames = [...new Set(pool)].filter(n => n && n !== 'NONE' && n !== requesterName);
+  const tagText = tagNames.map(n => mentionTag(n)).join(' ');
+
+  const actionValue = JSON.stringify({ date, requester: requesterName, role });
+  await client.chat.postMessage({
+    channel: body.channel.id,
+    text: `🙏 ${dateLabel(date)} ${roleLabel} 당번 교체 요청`,
+    blocks: [
+      { type: 'section', text: { type: 'mrkdwn', text: `${tagText}\n${requesterName} 님이 ${dateLabel(date)} ${roleLabel} 당번을 대신 해주실 분을 찾고 있어요. 😢🙏` } },
+      { type: 'actions', elements: [
+        { type: 'button', text: { type: 'plain_text', text: '✅ 수락' }, style: 'primary', action_id: 'delegate_accept', value: actionValue },
+        { type: 'button', text: { type: 'plain_text', text: '❌ 거절' }, style: 'danger', action_id: 'delegate_decline', value: actionValue },
+      ]},
+    ],
+  });
+  await respond({ replace_original: true, text: `✅ 채널에 *${dateLabel(date)}* ${roleLabel} 대리 요청을 올렸어요.` });
+});
+
+// ─── 요청 방식: 날짜 교체 (모달로 날짜 입력) ──────────
+app.action('req_swap', async ({ body, ack, client, respond }) => {
+  await ack();
+  const { date, role } = JSON.parse(body.actions[0].value);
+  const roleLabel = role === 'check' ? '크첵' : '메인';
+  await client.views.open({
+    trigger_id: body.trigger_id,
+    view: {
+      type: 'modal', callback_id: 'swap_modal',
+      private_metadata: JSON.stringify({ date, role, channel: body.channel.id }),
+      title: { type: 'plain_text', text: '날짜 교체 요청' },
+      submit: { type: 'plain_text', text: '요청' },
+      close: { type: 'plain_text', text: '취소' },
+      blocks: [
+        { type: 'section', text: { type: 'mrkdwn', text: `*${dateLabel(date)}* ${roleLabel} 당번을 바꿀 날짜를 선택하세요.` } },
+        { type: 'input', block_id: 'swap_date', label: { type: 'plain_text', text: '교체할 날짜' },
+          element: { type: 'datepicker', action_id: 'picked' } },
+      ],
+    },
+  });
+  await respond({ replace_original: true, text: '🔄 날짜 교체 요청 창을 열었어요. (창에서 날짜를 선택하세요)' });
+});
+
+// 날짜 교체 모달 제출 → 상대 당번에게 태그해 채널 공지
+app.view('swap_modal', async ({ body, ack, view, client }) => {
+  const { date, role, channel } = JSON.parse(view.private_metadata);
+  const date2 = view.state.values['swap_date']?.['picked']?.selected_date;
+  if (!date2) { await ack({ response_action: 'errors', errors: { swap_date: '날짜를 선택해주세요.' } }); return; }
+  if (date2 === date) { await ack({ response_action: 'errors', errors: { swap_date: '같은 날짜로는 교체할 수 없어요.' } }); return; }
+
+  const roleLabel = role === 'check' ? '크첵' : '메인';
+  const counterpart = role === 'check' ? getCheck(date2).name : getMain(date2).name;
+  if (!counterpart || counterpart === 'NONE') {
+    await ack({ response_action: 'errors', errors: { swap_date: `그 날짜에 ${roleLabel} 당번이 없어요.` } });
+    return;
+  }
+  await ack();
+
+  const requesterName = memberNameById(body.user.id) || await getRealName(app.client, body.user.id);
+  const actionValue = JSON.stringify({ date, date2, role, requester: requesterName, counterpart });
+  await client.chat.postMessage({
+    channel,
+    text: `🔄 ${dateLabel(date)} ↔ ${dateLabel(date2)} 날짜 교체 요청`,
+    blocks: [
+      { type: 'section', text: { type: 'mrkdwn', text: `${mentionTag(counterpart)}\n${requesterName} 님이 날짜 교체를 요청해요. 😢🙏\n${dateLabel(date)} ${requesterName} ↔ ${dateLabel(date2)} ${counterpart}` } },
+      { type: 'actions', elements: [
+        { type: 'button', text: { type: 'plain_text', text: '✅ 수락' }, style: 'primary', action_id: 'swap_accept', value: actionValue },
+        { type: 'button', text: { type: 'plain_text', text: '❌ 거절' }, style: 'danger', action_id: 'swap_decline', value: actionValue },
+      ]},
+    ],
+  });
+});
+
+// ─── 대리 요청 수락/거절 ──────────────────────────────
+app.action('delegate_accept', async ({ body, ack, client }) => {
   await ack();
   const { date, requester, role } = JSON.parse(body.actions[0].value);
   const acceptor = memberNameById(body.user.id) || await getRealName(app.client, body.user.id);
-  const short = shortDate(date);
   const roleLabel = role === 'check' ? '크첵' : '메인';
   overrides[`${date}:${role === 'check' ? 'check' : 'main'}`] = acceptor;
   await syncOverrideRow(date);
   await client.chat.update({
     channel: body.channel.id, ts: body.message.ts, text: `✅ 당번 교체 완료`,
-    blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `✅ *당번 교체 완료*\n\n*${short}* ${roleLabel} 당번이 ${requester} 님 → *${acceptor}* 님으로 변경됐어요! 🎉` } }],
+    blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `✅ *당번 교체 완료*\n\n*${dateLabel(date)}* ${roleLabel} 당번이 ${requester} 님 → *${acceptor}* 님으로 변경됐어요! 🎉` } }],
   });
   await updateWeeklyThread();
 });
 
-// ─── 거절 버튼 ────────────────────────────────────────
-app.action('duty_decline', async ({ body, ack, client }) => {
+app.action('delegate_decline', async ({ body, ack, client }) => {
   await ack();
-  const { date, requester, role } = JSON.parse(body.actions[0].value);
+  const { date, role } = JSON.parse(body.actions[0].value);
   const decliner = memberNameById(body.user.id) || await getRealName(app.client, body.user.id);
   const roleLabel = role === 'check' ? '크첵' : '메인';
-  await client.chat.postMessage({ channel: body.channel.id, thread_ts: body.message.ts, text: `*${decliner}* 님이 *${shortDate(date)}* ${roleLabel} 교체 요청을 거절했어요.` });
+  await client.chat.postMessage({ channel: body.channel.id, thread_ts: body.message.ts, text: `*${decliner}* 님이 *${dateLabel(date)}* ${roleLabel} 교체 요청을 거절했어요.` });
+});
+
+// ─── 날짜 교체 수락/거절 ──────────────────────────────
+app.action('swap_accept', async ({ body, ack, client }) => {
+  await ack();
+  const { date, date2, role, requester, counterpart } = JSON.parse(body.actions[0].value);
+  const roleKey = role === 'check' ? 'check' : 'main';
+  overrides[`${date}:${roleKey}`] = counterpart;
+  overrides[`${date2}:${roleKey}`] = requester;
+  await syncOverrideRow(date);
+  await syncOverrideRow(date2);
+  await client.chat.update({
+    channel: body.channel.id, ts: body.message.ts, text: `✅ 날짜 교체 완료`,
+    blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `✅ *날짜 교체 완료*\n\n${dateLabel(date)} ${counterpart} ↔ ${dateLabel(date2)} ${requester} 로 교체됐어요! 🎉` } }],
+  });
+  await updateWeeklyThread();
+});
+
+app.action('swap_decline', async ({ body, ack, client }) => {
+  await ack();
+  const { date, date2 } = JSON.parse(body.actions[0].value);
+  const decliner = memberNameById(body.user.id) || await getRealName(app.client, body.user.id);
+  await client.chat.postMessage({ channel: body.channel.id, thread_ts: body.message.ts, text: `*${decliner}* 님이 ${dateLabel(date)} ↔ ${dateLabel(date2)} 날짜 교체 요청을 거절했어요.` });
 });
 
 // ─── 이번달 주차 선택 버튼 ────────────────────────────
@@ -925,48 +1031,31 @@ app.event('app_mention', async ({ event, client, say }) => {
     return;
   }
 
-  // 요청 MM.DD — 본인 역할(메인/크첵) 자동 구분
+  // 요청 MM.DD — 본인 역할(메인/크첵) 자동 구분 후 요청 방식 선택 (나에게만 표시)
   if (cmd === '요청') {
     const date = parseDate(parts[1] || '');
     if (!date) { await reply('❌ 사용법: `@당번봇 요청 MM.DD`'); return; }
 
-    const short = shortDate(date);
     const requesterName = memberNameById(event.user);
-    const mainName = getMain(date).name;
-    const checkName = getCheck(date).name;
-
-    // 요청자의 역할 판별 (메인 우선)
-    let role = null;
-    if (requesterName && requesterName === mainName) role = 'main';
-    else if (requesterName && requesterName === checkName) role = 'check';
-
+    const role = requesterRole(date, requesterName);
     if (!role) {
-      await reply(`❌ *${short}* 당번자가 아니에요. 본인 당번날만 요청할 수 있어요.`);
+      await client.chat.postEphemeral({
+        channel: event.channel, user: event.user,
+        text: `❌ ${dateLabel(date)} 당번자가 아니에요. 본인 당번날만 요청할 수 있어요.`,
+      });
       return;
     }
 
     const roleLabel = role === 'main' ? '메인' : '크첵';
-    // 태그 대상: 메인 → 멤버 전체, 크첵 → 크첵루프 인원 (본인 제외)
-    const pool = role === 'main'
-      ? Object.keys(sheetCache.members)
-      : sheetCache.checkLoop.map(r => r.check);
-    const tagNames = [...new Set(pool)].filter(n => n && n !== 'NONE' && n !== requesterName);
-    const tagText = tagNames.map(n => mentionTag(n)).join(' ');
-
-    const checkStatus = (checkName && checkName !== 'NONE') ? checkName : '없음';
-    const statusLine = `📌 *${short}* 현황 — 메인: ${mainName || '—'} / 크첵: ${checkStatus}`;
-    const bodyText = `${tagText}\n${requesterName} 님이 ${short} ${roleLabel} 당번을 대신 해주실 분을 찾고 있어요. 😢🙏\n\n${statusLine}`;
-
-    const actionValue = JSON.stringify({ date, requester: requesterName, role });
-    await client.chat.postMessage({
-      channel: event.channel,
-      thread_ts: threadTs,
-      text: `🙏 ${short} ${roleLabel} 당번 교체 요청`,
+    const val = JSON.stringify({ date, role });
+    await client.chat.postEphemeral({
+      channel: event.channel, user: event.user,
+      text: `${dateLabel(date)} ${roleLabel} 당번 요청`,
       blocks: [
-        { type: 'section', text: { type: 'mrkdwn', text: bodyText } },
+        { type: 'section', text: { type: 'mrkdwn', text: `🙏 *${dateLabel(date)}* ${roleLabel} 당번 요청\n어떤 방식으로 요청할까요?` } },
         { type: 'actions', elements: [
-          { type: 'button', text: { type: 'plain_text', text: '✅ 수락' }, style: 'primary', action_id: 'duty_accept', value: actionValue },
-          { type: 'button', text: { type: 'plain_text', text: '❌ 거절' }, style: 'danger', action_id: 'duty_decline', value: actionValue },
+          { type: 'button', text: { type: 'plain_text', text: '🙋 대리 요청' }, style: 'primary', action_id: 'req_delegate', value: val },
+          { type: 'button', text: { type: 'plain_text', text: '🔄 날짜 교체' }, action_id: 'req_swap', value: val },
         ]},
       ],
     });
