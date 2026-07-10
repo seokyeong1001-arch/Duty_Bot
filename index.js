@@ -200,7 +200,7 @@ function dateLabel(dateStr) {
   const d = new Date(dateStr);
   const dayNames = ['일', '월', '화', '수', '목', '금', '토'];
   const [, mm, dd] = dateStr.split('-');
-  return `${mm}/${dd} (${dayNames[d.getDay()]})`;
+  return `${mm}.${dd} (${dayNames[d.getDay()]})`;
 }
 
 function getWeekLabel(dateStr) {
@@ -348,9 +348,44 @@ function weeklyMessage(fromDateStr) {
     const { name: check } = getCheck(ds);
     const mainStr = main || '—';
     const dutyLine = (check && check !== 'NONE') ? `${mainStr} (${check})` : mainStr;
-    lines.push(`• ${mm}/${dd} (${day})  ${dutyLine}`);
+    lines.push(`• ${mm}.${dd} (${day})  ${dutyLine}`);
   }
   return lines.join('\n');
+}
+
+// ─── 이번달 주차별 일정 ───────────────────────────────
+// 해당 월에 속한 날짜를 주차별로 그룹핑
+function getMonthWeeks(dateStr) {
+  const d = new Date(dateStr);
+  const year = d.getFullYear();
+  const month = d.getMonth(); // 0-based
+  const firstDay = new Date(year, month, 1);
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const weeksMap = {};
+  for (let day = 1; day <= daysInMonth; day++) {
+    const cur = new Date(year, month, day);
+    const week = Math.ceil((day + firstDay.getDay()) / 7);
+    const ds = cur.toLocaleDateString('sv-SE');
+    (weeksMap[week] = weeksMap[week] || []).push(ds);
+  }
+  return Object.keys(weeksMap).map(w => ({
+    week: Number(w),
+    label: `${month + 1}월 ${w}주차`,
+    dates: weeksMap[w],
+  }));
+}
+
+function formatWeekDates(dates) {
+  const dayNames = ['일', '월', '화', '수', '목', '금', '토'];
+  return dates.map(ds => {
+    const [, mm, dd] = ds.split('-');
+    const day = dayNames[new Date(ds).getDay()];
+    const { name: main } = getMain(ds);
+    const { name: check } = getCheck(ds);
+    const mainStr = main || '—';
+    const dutyLine = (check && check !== 'NONE') ? `${mainStr} (${check})` : mainStr;
+    return `• ${mm}.${dd} (${day})  ${dutyLine}`;
+  }).join('\n');
 }
 
 // ─── 주간 스레드 ──────────────────────────────────────
@@ -392,74 +427,37 @@ async function ensureWeeklyThread() {
 // ─── 매뉴얼 ───────────────────────────────────────────
 const MANUAL_TEXT = `📖 *당번봇 매뉴얼*
 
----
-
-📌 *슬래시 커맨드*
-
-\`/당번변경 06.04 박지연\`
-→ 당번 변경
-
-\`/당번변경 06.04 박지연(이석영)\`
-→ 당번+크첵 변경
-
-\`/당번취소 06.04\`
-→ 해당 날짜 변경 취소
-
-\`/당번요청 06.04\`
-→ 교체 요청
-
-\`/당번연차 문선정 07.14~07.16\`
-→ 연차 등록 (단일 날짜: \`07.14\`)
-
-\`/당번연차취소 문선정 07.14~07.16\`
-→ 연차 취소
-
-\`/당번연차확인\`
-→ 등록된 연차 목록 보기
-
-\`/당번주간\`
-→ 이번 주 일정 나만 보기
-
-\`/당번주간 다음주\`
-→ 다음 주 일정 나만 보기
-
-\`/당번날짜 06.04\`
-→ 특정 날짜 당번 조회
-
-\`/당번매뉴얼\`
-→ 이 매뉴얼 보기
-
----
-
-💬 *멘션 커맨드 (스레드에서도 사용 가능)*
-
-\`@당번봇 당번변경 06.04 박지연\`
-\`@당번봇 당번변경 06.04 박지연(이석영)\`
-\`@당번봇 당번취소 06.04\`
-\`@당번봇 당번요청 06.04\`
-\`@당번봇 당번연차 문선정 07.14~07.16\`
-\`@당번봇 당번연차취소 문선정 07.14~07.16\`
-\`@당번봇 당번연차확인\`
-\`@당번봇 당번주간\`
-\`@당번봇 당번주간 다음주\`
-\`@당번봇 당번날짜 06.04\`
-\`@당번봇 당번매뉴얼\`
-\`@당번봇 당번캐시갱신\`
-
----
+🤖 *이 봇은 무엇인가요?*
+매일 아침 당번을 자동으로 알려주는 봇이에요.
+당번 순서는 구글 시트에서 관리하고, 봇은 시트를 읽어서 알림을 보내요.
+순서 변경이나 팀원 추가는 시트에서 직접 수정하면 돼요.
 
 📅 *자동 알림*
+• 매주 월요일 07:00 — 이번 주 당번 스레드 생성
+• 매일 07:30 — 오늘 당번 알림 + 당번자 태그
+• 매일 18:00 — 내일 당번 예고 + 당번자 태그
 
-• 매일 07:30 — 오늘 당번 알림 (당번자 태그)
-• 매일 18:00 — 내일 당번 예고 (당번자 태그)
-• 매주 월요일 07:00 — 주간 스레드 생성
+🔍 *당번 확인*
+\`@당번봇 이번주\` — 이번 주 일정
+\`@당번봇 다음주\` — 다음 주 일정
+\`@당번봇 이번달\` — 이번 달 주차별 일정 선택
+\`@당번봇 MM.DD\` — 특정 날짜 당번 조회
 
----
+✏️ *당번 변경*
+\`@당번봇 변경 MM.DD 홍길동\` — 해당 날짜 당번 직접 변경
+\`@당번봇 취소 MM.DD\` — 변경 취소, 원래 순서로 복구
 
-🏖️ *연차 처리*
+🙏 *교체 요청*
+\`@당번봇 요청 MM.DD\` — 채널에 교체 요청 공지
+→ 누군가 수락하면 자동으로 당번 변경
 
-연차 등록 시 해당 날짜의 메인/크첵 당번에서 자동으로 다음 순번으로 대체되며,
-알림 메시지에 *(연차 대체)* 표시가 붙어요.`;
+🏖️ *연차*
+\`@당번봇 연차 홍길동 MM.DD~MM.DD\` — 연차 등록
+\`@당번봇 연차취소 홍길동 MM.DD~MM.DD\` — 연차 취소
+\`@당번봇 연차확인\` — 등록된 연차 목록
+
+⚙️ *관리자*
+\`@당번봇 캐시갱신\` — 구글 시트 변경사항 즉시 반영`;
 
 // ─── 연차 슬래시 커맨드 공통 파서 ────────────────────
 function parseLeaveArgs(text) {
@@ -470,148 +468,6 @@ function parseLeaveArgs(text) {
   if (!dates) return null;
   return { name, dates, rangeStr };
 }
-
-// ─── /당번변경 ────────────────────────────────────────
-app.command('/당번변경', async ({ command, ack, respond }) => {
-  await ack();
-  const parts = command.text.trim().split(/\s+/);
-  if (parts.length !== 2) {
-    await respond({ text: '❌ 사용법:\n• 메인만: `/당번변경 06.02 박지연`\n• 메인+크첵: `/당번변경 06.02 박지연(이석영)`', response_type: 'ephemeral' }); return;
-  }
-  const [rawDate, nameInput] = parts;
-  const date = parseDate(rawDate);
-  if (!date) { await respond({ text: '❌ 날짜 형식: `06.02`', response_type: 'ephemeral' }); return; }
-
-  const combinedMatch = nameInput.match(/^(.+?)\((.+?)\)$/);
-  if (combinedMatch) {
-    const [, mainName, checkName] = combinedMatch;
-    overrides[`${date}:main`] = mainName;
-    overrides[`${date}:check`] = checkName;
-    await updateWeeklyThread();
-    await respond({ text: `✅ *${dateLabel(date)}* 당번 *${mainName}* 님, 크첵 *${checkName}* 님으로 변경했어요.`, response_type: 'in_channel' });
-    return;
-  }
-
-  overrides[`${date}:main`] = nameInput;
-  delete overrides[`${date}:check`];
-  await updateWeeklyThread();
-  await respond({ text: `✅ *${dateLabel(date)}* 를 *${nameInput}* 님으로 변경했어요.`, response_type: 'in_channel' });
-});
-
-// ─── /당번취소 ────────────────────────────────────────
-app.command('/당번취소', async ({ command, ack, respond }) => {
-  await ack();
-  const date = parseDate(command.text.trim());
-  if (!date) { await respond({ text: '❌ 날짜 형식: `06.02`', response_type: 'ephemeral' }); return; }
-
-  const keys = [`${date}:main`, `${date}:check`];
-  const removed = keys.filter(k => k in overrides);
-  removed.forEach(k => delete overrides[k]);
-
-  if (removed.length > 0) {
-    await updateWeeklyThread();
-    await respond({ text: `↩️ *${dateLabel(date)}* 변경을 취소했어요.`, response_type: 'in_channel' });
-  } else {
-    await respond({ text: `ℹ️ 변경된 내용이 없어요.`, response_type: 'ephemeral' });
-  }
-});
-
-// ─── /당번주간 ────────────────────────────────────────
-app.command('/당번주간', async ({ command, ack, respond }) => {
-  await ack();
-  const arg = command.text.trim();
-  if (arg === '다음주') {
-    const d = new Date(todayStr());
-    d.setDate(d.getDate() + 7);
-    const nextWeek = d.toLocaleDateString('sv-SE');
-    await respond({ text: `📅 *${getWeekLabel(nextWeek)} 당번 일정*\n${weeklyMessage(nextWeek)}`, response_type: 'ephemeral' });
-    return;
-  }
-  const today = todayStr();
-  await respond({ text: `📅 *${getWeekLabel(today)} 당번 일정*\n${weeklyMessage(today)}`, response_type: 'ephemeral' });
-});
-
-// ─── /당번날짜 ────────────────────────────────────────
-app.command('/당번날짜', async ({ command, ack, respond }) => {
-  await ack();
-  const date = parseDate(command.text.trim());
-  if (!date) { await respond({ text: '❌ 날짜 형식: `06.04`', response_type: 'ephemeral' }); return; }
-  const { name: main } = getMain(date);
-  const { name: check } = getCheck(date);
-  const line = main ? formatDutyLine(main, check, false) : '—';
-  await respond({ text: `📅 *${dateLabel(date)}* 당번: ${line} 님`, response_type: 'ephemeral' });
-});
-
-// ─── /당번다음주 ─────────────────────────────────────
-app.command('/당번다음주', async ({ ack, respond }) => {
-  await ack();
-  const d = new Date(todayStr());
-  d.setDate(d.getDate() + 7);
-  const nextWeek = d.toLocaleDateString('sv-SE');
-  await respond({ text: `📅 *${getWeekLabel(nextWeek)} 당번 일정*\n${weeklyMessage(nextWeek)}`, response_type: 'ephemeral' });
-});
-
-// ─── /당번요청 ────────────────────────────────────────
-app.command('/당번요청', async ({ command, ack, client, respond }) => {
-  await ack();
-  const date = parseDate(command.text.trim().split(/\s+/)[0]);
-  if (!date) { await respond({ text: '❌ 사용법: `/당번요청 06.02`', response_type: 'ephemeral' }); return; }
-  const requester = await getRealName(client, command.user_id);
-  const label = dateLabel(date);
-  const actionValue = JSON.stringify({ date, requester });
-  await client.chat.postMessage({
-    channel: CONFIG.notifyChannel,
-    text: `🙏 당번 교체 요청`,
-    blocks: [
-      { type: 'section', text: { type: 'mrkdwn', text: `🙏 *당번 교체 요청*\n\n*${label}* 당번을 대신 해주실 분 있으신가요?\n요청자: *${requester}* 님` } },
-      { type: 'actions', elements: [
-        { type: 'button', text: { type: 'plain_text', text: '✅ 수락' }, style: 'primary', action_id: 'duty_accept', value: actionValue },
-        { type: 'button', text: { type: 'plain_text', text: '❌ 거절' }, style: 'danger', action_id: 'duty_decline', value: actionValue },
-      ]},
-    ],
-  });
-  await respond({ text: `📨 *${label}* 교체 요청을 채널에 보냈어요.`, response_type: 'ephemeral' });
-});
-
-// ─── /당번연차 ────────────────────────────────────────
-app.command('/당번연차', async ({ command, ack, respond }) => {
-  await ack();
-  const parsed = parseLeaveArgs(command.text);
-  if (!parsed) {
-    await respond({ text: '❌ 사용법: `/당번연차 문선정 07.14~07.16`', response_type: 'ephemeral' }); return;
-  }
-  const { name, dates, rangeStr } = parsed;
-  addLeave(name, dates);
-  await respond({ text: `🏖️ *${name}* 님 연차 등록 완료 (${rangeStr}, ${dates.length}일)`, response_type: 'in_channel' });
-});
-
-// ─── /당번연차취소 ────────────────────────────────────
-app.command('/당번연차취소', async ({ command, ack, respond }) => {
-  await ack();
-  const parsed = parseLeaveArgs(command.text);
-  if (!parsed) {
-    await respond({ text: '❌ 사용법: `/당번연차취소 문선정 07.14~07.16`', response_type: 'ephemeral' }); return;
-  }
-  const { name, dates, rangeStr } = parsed;
-  const removed = removeLeave(name, dates);
-  if (removed > 0) {
-    await respond({ text: `↩️ *${name}* 님 연차 취소 완료 (${rangeStr}, ${removed}일)`, response_type: 'in_channel' });
-  } else {
-    await respond({ text: `ℹ️ *${name}* 님의 해당 날짜 연차가 없어요.`, response_type: 'ephemeral' });
-  }
-});
-
-// ─── /당번연차확인 ────────────────────────────────────
-app.command('/당번연차확인', async ({ ack, respond }) => {
-  await ack();
-  await respond({ text: leaveListText(), response_type: 'ephemeral' });
-});
-
-// ─── /당번매뉴얼 ──────────────────────────────────────
-app.command('/당번매뉴얼', async ({ ack, respond }) => {
-  await ack();
-  await respond({ text: MANUAL_TEXT, response_type: 'ephemeral' });
-});
 
 // ─── 수락 버튼 ────────────────────────────────────────
 app.action('duty_accept', async ({ body, ack, client }) => {
@@ -634,6 +490,53 @@ app.action('duty_decline', async ({ body, ack, client }) => {
   const decliner = await getRealName(app.client, body.user.id);
   const label = dateLabel(date);
   await client.chat.postMessage({ channel: body.channel.id, thread_ts: body.message.ts, text: `*${decliner}* 님이 *${label}* 교체 요청을 거절했어요.` });
+});
+
+// ─── 이번달 주차 선택 버튼 ────────────────────────────
+function monthSelectBlocks(anchor) {
+  const weeks = getMonthWeeks(anchor);
+  const monthNum = new Date(anchor).getMonth() + 1;
+  const options = weeks.map(w => ({
+    text: { type: 'plain_text', text: w.label },
+    value: String(w.week),
+  }));
+  return [
+    { type: 'section', text: { type: 'mrkdwn', text: `📅 *${monthNum}월 당번 일정*\n\n조회할 주차를 선택하세요. (복수 선택 가능)` } },
+    { type: 'actions', block_id: 'month_weeks', elements: [
+      { type: 'checkboxes', action_id: 'month_week_select', options },
+    ]},
+    { type: 'actions', elements: [
+      { type: 'button', text: { type: 'plain_text', text: '✅ 확인' }, style: 'primary', action_id: 'month_confirm', value: anchor },
+      { type: 'button', text: { type: 'plain_text', text: '📋 전체보기' }, action_id: 'month_all', value: anchor },
+    ]},
+  ];
+}
+
+// 체크박스 선택 자체는 ack만
+app.action('month_week_select', async ({ ack }) => { await ack(); });
+
+app.action('month_confirm', async ({ body, ack, client }) => {
+  await ack();
+  const anchor = body.actions[0].value;
+  const threadTs = body.message.thread_ts || body.message.ts;
+  const selected = body.state?.values?.['month_weeks']?.['month_week_select']?.selected_options || [];
+  if (!selected.length) {
+    await client.chat.postMessage({ channel: body.channel.id, thread_ts: threadTs, text: '❌ 주차를 하나 이상 선택해주세요.' });
+    return;
+  }
+  const selectedNums = selected.map(o => Number(o.value));
+  const chosen = getMonthWeeks(anchor).filter(w => selectedNums.includes(w.week));
+  const sections = chosen.map(w => `📅 *${w.label}*\n${formatWeekDates(w.dates)}`).join('\n\n');
+  await client.chat.postMessage({ channel: body.channel.id, thread_ts: threadTs, text: sections });
+});
+
+app.action('month_all', async ({ body, ack, client }) => {
+  await ack();
+  const anchor = body.actions[0].value;
+  const threadTs = body.message.thread_ts || body.message.ts;
+  const monthNum = new Date(anchor).getMonth() + 1;
+  const sections = getMonthWeeks(anchor).map(w => `📅 *${w.label}*\n${formatWeekDates(w.dates)}`).join('\n\n');
+  await client.chat.postMessage({ channel: body.channel.id, thread_ts: threadTs, text: `📅 *${monthNum}월 전체 당번 일정*\n\n${sections}` });
 });
 
 // ─── 매주 월요일 07:00 — 새 주간 스레드 생성 ──────────
@@ -684,68 +587,44 @@ app.event('app_mention', async ({ event, client, say }) => {
 
   const reply = async (msg) => { await say({ text: msg, thread_ts: threadTs }); };
 
-  if (!cmd || cmd === '매뉴얼' || cmd === '당번매뉴얼') {
+  // 매뉴얼 (빈 멘션 포함)
+  if (!cmd || cmd === '매뉴얼') {
     await reply(MANUAL_TEXT); return;
   }
 
-  if (cmd === '당번캐시갱신') {
+  // 캐시갱신
+  if (cmd === '캐시갱신') {
     await reply('🔄 시트 캐시 갱신 중...');
     await loadSheets();
     await reply(`✅ 캐시 갱신 완료! 멤버 ${Object.keys(sheetCache.members).length}명 / 루프 ${sheetCache.loop.length}칸 / 크첵루프 ${sheetCache.checkLoop.length}칸`);
     return;
   }
 
-  if (cmd === '당번연차') {
-    // @당번봇 당번연차 문선정 07.14~07.16
-    const parsed = parts.length === 3 ? parseLeaveArgs(`${parts[1]} ${parts[2]}`) : null;
-    if (!parsed) { await reply('❌ 사용법: `@당번봇 당번연차 문선정 07.14~07.16`'); return; }
-    const { name, dates, rangeStr } = parsed;
-    addLeave(name, dates);
-    await reply(`🏖️ *${name}* 님 연차 등록 완료 (${rangeStr}, ${dates.length}일)`);
-    return;
-  }
-
-  if (cmd === '당번연차취소') {
-    const parsed = parts.length === 3 ? parseLeaveArgs(`${parts[1]} ${parts[2]}`) : null;
-    if (!parsed) { await reply('❌ 사용법: `@당번봇 당번연차취소 문선정 07.14~07.16`'); return; }
-    const { name, dates, rangeStr } = parsed;
-    const removed = removeLeave(name, dates);
-    if (removed > 0) {
-      await reply(`↩️ *${name}* 님 연차 취소 완료 (${rangeStr}, ${removed}일)`);
-    } else {
-      await reply(`ℹ️ *${name}* 님의 해당 날짜 연차가 없어요.`);
-    }
-    return;
-  }
-
-  if (cmd === '당번연차확인') {
-    await reply(leaveListText()); return;
-  }
-
-  if (cmd === '당번주간') {
-    if (parts[1] === '다음주') {
-      const d = new Date(todayStr());
-      d.setDate(d.getDate() + 7);
-      const nextWeek = d.toLocaleDateString('sv-SE');
-      await reply(`📅 *${getWeekLabel(nextWeek)} 당번 일정*\n${weeklyMessage(nextWeek)}`); return;
-    }
+  // 이번주
+  if (cmd === '이번주') {
     const today = todayStr();
     await reply(`📅 *${getWeekLabel(today)} 당번 일정*\n${weeklyMessage(today)}`); return;
   }
 
-  if (cmd === '당번날짜') {
-    const date = parseDate(parts[1] || '');
-    if (!date) { await reply('❌ 날짜 형식: `06.04`'); return; }
-    const { name: main } = getMain(date);
-    const { name: check } = getCheck(date);
-    const line = main ? formatDutyLine(main, check, false) : '—';
-    await reply(`📅 *${dateLabel(date)}* 당번: ${line} 님`); return;
+  // 다음주
+  if (cmd === '다음주') {
+    const d = new Date(todayStr());
+    d.setDate(d.getDate() + 7);
+    const nextWeek = d.toLocaleDateString('sv-SE');
+    await reply(`📅 *${getWeekLabel(nextWeek)} 당번 일정*\n${weeklyMessage(nextWeek)}`); return;
   }
 
-  if (cmd === '당번변경') {
-    if (parts.length !== 3) { await reply('❌ 사용법:\n• `@당번봇 당번변경 06.04 박지연`\n• `@당번봇 당번변경 06.04 박지연(이석영)`'); return; }
+  // 이번달 — 주차 선택 버튼
+  if (cmd === '이번달') {
+    await say({ text: '📅 이번 달 당번 일정 — 주차를 선택하세요.', thread_ts: threadTs, blocks: monthSelectBlocks(todayStr()) });
+    return;
+  }
+
+  // 변경 MM.DD 홍길동  (홍길동(이석영) 형태로 크첵 동시 변경 가능)
+  if (cmd === '변경') {
+    if (parts.length !== 3) { await reply('❌ 사용법: `@당번봇 변경 MM.DD 홍길동`'); return; }
     const date = parseDate(parts[1]);
-    if (!date) { await reply('❌ 날짜 형식: `06.04`'); return; }
+    if (!date) { await reply('❌ 날짜 형식: `MM.DD` (예: 06.04)'); return; }
     const nameInput = parts[2];
     const combinedMatch = nameInput.match(/^(.+?)\((.+?)\)$/);
     if (combinedMatch) {
@@ -763,9 +642,10 @@ app.event('app_mention', async ({ event, client, say }) => {
     return;
   }
 
-  if (cmd === '당번취소') {
+  // 취소 MM.DD
+  if (cmd === '취소') {
     const date = parseDate(parts[1] || '');
-    if (!date) { await reply('❌ 날짜 형식: `06.04`'); return; }
+    if (!date) { await reply('❌ 사용법: `@당번봇 취소 MM.DD`'); return; }
     const keys = [`${date}:main`, `${date}:check`];
     const removed = keys.filter(k => k in overrides);
     removed.forEach(k => delete overrides[k]);
@@ -778,9 +658,10 @@ app.event('app_mention', async ({ event, client, say }) => {
     return;
   }
 
-  if (cmd === '당번요청') {
+  // 요청 MM.DD
+  if (cmd === '요청') {
     const date = parseDate(parts[1] || '');
-    if (!date) { await reply('❌ 사용법: `@당번봇 당번요청 06.04`'); return; }
+    if (!date) { await reply('❌ 사용법: `@당번봇 요청 MM.DD`'); return; }
     const requesterName = await getRealName(client, event.user);
     const label = dateLabel(date);
     const actionValue = JSON.stringify({ date, requester: requesterName });
@@ -799,7 +680,45 @@ app.event('app_mention', async ({ event, client, say }) => {
     return;
   }
 
-  await reply(`❓ 모르는 명령어예요. \`@당번봇 당번매뉴얼\` 로 사용법을 확인해주세요!`);
+  // 연차 홍길동 MM.DD~MM.DD
+  if (cmd === '연차') {
+    const parsed = parts.length === 3 ? parseLeaveArgs(`${parts[1]} ${parts[2]}`) : null;
+    if (!parsed) { await reply('❌ 사용법: `@당번봇 연차 홍길동 MM.DD~MM.DD`'); return; }
+    const { name, dates, rangeStr } = parsed;
+    addLeave(name, dates);
+    await reply(`🏖️ *${name}* 님 연차 등록 완료 (${rangeStr}, ${dates.length}일)`);
+    return;
+  }
+
+  // 연차취소 홍길동 MM.DD~MM.DD
+  if (cmd === '연차취소') {
+    const parsed = parts.length === 3 ? parseLeaveArgs(`${parts[1]} ${parts[2]}`) : null;
+    if (!parsed) { await reply('❌ 사용법: `@당번봇 연차취소 홍길동 MM.DD~MM.DD`'); return; }
+    const { name, dates, rangeStr } = parsed;
+    const removed = removeLeave(name, dates);
+    if (removed > 0) {
+      await reply(`↩️ *${name}* 님 연차 취소 완료 (${rangeStr}, ${removed}일)`);
+    } else {
+      await reply(`ℹ️ *${name}* 님의 해당 날짜 연차가 없어요.`);
+    }
+    return;
+  }
+
+  // 연차확인
+  if (cmd === '연차확인') {
+    await reply(leaveListText()); return;
+  }
+
+  // MM.DD — 특정 날짜 당번 조회
+  const dateQuery = parseDate(cmd);
+  if (dateQuery) {
+    const { name: main } = getMain(dateQuery);
+    const { name: check } = getCheck(dateQuery);
+    const line = main ? formatDutyLine(main, check, false) : '—';
+    await reply(`📅 *${dateLabel(dateQuery)}* 당번: ${line} 님`); return;
+  }
+
+  await reply(`❓ 모르는 명령어예요. \`@당번봇 매뉴얼\` 로 사용법을 확인해주세요!`);
 });
 
 // ─── 서버 시작 ────────────────────────────────────────
