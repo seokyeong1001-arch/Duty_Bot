@@ -432,6 +432,12 @@ function dateLabel(dateStr) {
   return `${mm}.${dd} (${dayNames[d.getDay()]})`;
 }
 
+// 'YYYY-MM-DD' → 'MM.DD'
+function shortDate(dateStr) {
+  const [, mm, dd] = dateStr.split('-');
+  return `${mm}.${dd}`;
+}
+
 function getWeekLabel(dateStr) {
   const d = new Date(dateStr);
   const month = d.getMonth() + 1;
@@ -536,6 +542,14 @@ function getCheck(dateStr) {
 function mentionTag(name) {
   const id = sheetCache.members[name];
   return id ? `<@${id}>` : `*${name}*`;
+}
+
+// 슬랙 유저 ID → 멤버 시트 이름 (없으면 null)
+function memberNameById(userId) {
+  for (const [name, id] of Object.entries(sheetCache.members)) {
+    if (id && id === userId) return name;
+  }
+  return null;
 }
 
 // ─── 메시지 포맷 ──────────────────────────────────────
@@ -701,14 +715,15 @@ function parseLeaveArgs(text) {
 // ─── 수락 버튼 ────────────────────────────────────────
 app.action('duty_accept', async ({ body, ack, client }) => {
   await ack();
-  const { date, requester } = JSON.parse(body.actions[0].value);
-  const acceptor = await getRealName(app.client, body.user.id);
-  const label = dateLabel(date);
-  overrides[`${date}:main`] = acceptor;
+  const { date, requester, role } = JSON.parse(body.actions[0].value);
+  const acceptor = memberNameById(body.user.id) || await getRealName(app.client, body.user.id);
+  const short = shortDate(date);
+  const roleLabel = role === 'check' ? '크첵' : '메인';
+  overrides[`${date}:${role === 'check' ? 'check' : 'main'}`] = acceptor;
   await syncOverrideRow(date);
   await client.chat.update({
     channel: body.channel.id, ts: body.message.ts, text: `✅ 당번 교체 완료`,
-    blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `✅ *당번 교체 완료*\n\n*${label}* 당번이 *${acceptor}* 님으로 변경됐어요!\n${requester} 님 → *${acceptor}* 님 🎉` } }],
+    blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `✅ *당번 교체 완료*\n\n*${short}* ${roleLabel} 당번이 ${requester} 님 → *${acceptor}* 님으로 변경됐어요! 🎉` } }],
   });
   await updateWeeklyThread();
 });
@@ -716,10 +731,10 @@ app.action('duty_accept', async ({ body, ack, client }) => {
 // ─── 거절 버튼 ────────────────────────────────────────
 app.action('duty_decline', async ({ body, ack, client }) => {
   await ack();
-  const { date, requester } = JSON.parse(body.actions[0].value);
-  const decliner = await getRealName(app.client, body.user.id);
-  const label = dateLabel(date);
-  await client.chat.postMessage({ channel: body.channel.id, thread_ts: body.message.ts, text: `*${decliner}* 님이 *${label}* 교체 요청을 거절했어요.` });
+  const { date, requester, role } = JSON.parse(body.actions[0].value);
+  const decliner = memberNameById(body.user.id) || await getRealName(app.client, body.user.id);
+  const roleLabel = role === 'check' ? '크첵' : '메인';
+  await client.chat.postMessage({ channel: body.channel.id, thread_ts: body.message.ts, text: `*${decliner}* 님이 *${shortDate(date)}* ${roleLabel} 교체 요청을 거절했어요.` });
 });
 
 // ─── 이번달 주차 선택 버튼 ────────────────────────────
@@ -745,15 +760,26 @@ function monthSelectBlocks(anchor) {
 // 체크박스 선택 자체는 ack만
 app.action('month_week_select', async ({ ack }) => { await ack(); });
 
+// 버튼 메시지에서 버튼 제거 + "선택 완료" 텍스트로 교체
+async function markMonthSelectDone(client, body, monthNum) {
+  await client.chat.update({
+    channel: body.channel.id, ts: body.message.ts,
+    text: `📅 ${monthNum}월 주차 선택 완료`,
+    blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `📅 *${monthNum}월 주차 선택 완료*` } }],
+  });
+}
+
 app.action('month_confirm', async ({ body, ack, client }) => {
   await ack();
   const anchor = body.actions[0].value;
   const threadTs = body.message.thread_ts || body.message.ts;
+  const monthNum = new Date(anchor).getMonth() + 1;
   const selected = body.state?.values?.['month_weeks']?.['month_week_select']?.selected_options || [];
   if (!selected.length) {
     await client.chat.postMessage({ channel: body.channel.id, thread_ts: threadTs, text: '❌ 주차를 하나 이상 선택해주세요.' });
     return;
   }
+  await markMonthSelectDone(client, body, monthNum);
   const selectedNums = selected.map(o => Number(o.value));
   const chosen = getMonthWeeks(anchor).filter(w => selectedNums.includes(w.week));
   const sections = chosen.map(w => `📅 *${w.label}*\n${formatWeekDates(w.dates)}`).join('\n\n');
@@ -765,6 +791,7 @@ app.action('month_all', async ({ body, ack, client }) => {
   const anchor = body.actions[0].value;
   const threadTs = body.message.thread_ts || body.message.ts;
   const monthNum = new Date(anchor).getMonth() + 1;
+  await markMonthSelectDone(client, body, monthNum);
   const sections = getMonthWeeks(anchor).map(w => `📅 *${w.label}*\n${formatWeekDates(w.dates)}`).join('\n\n');
   await client.chat.postMessage({ channel: body.channel.id, thread_ts: threadTs, text: `📅 *${monthNum}월 전체 당번 일정*\n\n${sections}` });
 });
@@ -858,20 +885,26 @@ app.event('app_mention', async ({ event, client, say }) => {
     if (!date) { await reply('❌ 날짜 형식: `MM.DD` (예: 06.04)'); return; }
     const nameInput = parts[2];
     const combinedMatch = nameInput.match(/^(.+?)\((.+?)\)$/);
+
+    // 변경 전 담당자 (override 반영 전에 계산)
+    const prevMain = getMain(date).name || '—';
+    const prevCheck = getCheck(date).name;
+
     if (combinedMatch) {
       const [, mainName, checkName] = combinedMatch;
       overrides[`${date}:main`] = mainName;
       overrides[`${date}:check`] = checkName;
       await syncOverrideRow(date);
       await updateWeeklyThread();
-      await reply(`✅ *${dateLabel(date)}* 당번 *${mainName}* 님, 크첵 *${checkName}* 님으로 변경했어요.`);
+      const beforeStr = (prevCheck && prevCheck !== 'NONE') ? `${prevMain}(${prevCheck})` : prevMain;
+      await reply(`✅ *${dateLabel(date)}* ${beforeStr} → ${mainName}(${checkName}) 으로 변경했어요.`);
       return;
     }
     overrides[`${date}:main`] = nameInput;
     delete overrides[`${date}:check`];
     await syncOverrideRow(date);
     await updateWeeklyThread();
-    await reply(`✅ *${dateLabel(date)}* 를 *${nameInput}* 님으로 변경했어요.`);
+    await reply(`✅ *${dateLabel(date)}* ${prevMain} → ${nameInput} 으로 변경했어요.`);
     return;
   }
 
@@ -892,19 +925,45 @@ app.event('app_mention', async ({ event, client, say }) => {
     return;
   }
 
-  // 요청 MM.DD
+  // 요청 MM.DD — 본인 역할(메인/크첵) 자동 구분
   if (cmd === '요청') {
     const date = parseDate(parts[1] || '');
     if (!date) { await reply('❌ 사용법: `@당번봇 요청 MM.DD`'); return; }
-    const requesterName = await getRealName(client, event.user);
-    const label = dateLabel(date);
-    const actionValue = JSON.stringify({ date, requester: requesterName });
+
+    const short = shortDate(date);
+    const requesterName = memberNameById(event.user);
+    const mainName = getMain(date).name;
+    const checkName = getCheck(date).name;
+
+    // 요청자의 역할 판별 (메인 우선)
+    let role = null;
+    if (requesterName && requesterName === mainName) role = 'main';
+    else if (requesterName && requesterName === checkName) role = 'check';
+
+    if (!role) {
+      await reply(`❌ *${short}* 당번자가 아니에요. 본인 당번날만 요청할 수 있어요.`);
+      return;
+    }
+
+    const roleLabel = role === 'main' ? '메인' : '크첵';
+    // 태그 대상: 메인 → 멤버 전체, 크첵 → 크첵루프 인원 (본인 제외)
+    const pool = role === 'main'
+      ? Object.keys(sheetCache.members)
+      : sheetCache.checkLoop.map(r => r.check);
+    const tagNames = [...new Set(pool)].filter(n => n && n !== 'NONE' && n !== requesterName);
+    const tagText = tagNames.map(n => mentionTag(n)).join(' ');
+
+    const checkStatus = (checkName && checkName !== 'NONE') ? checkName : '없음';
+    const statusLine = `📌 *${short}* 현황 — 메인: ${mainName || '—'} / 크첵: ${checkStatus}`;
+    const bodyText = `${tagText}\n${requesterName} 님이 ${short} ${roleLabel} 당번을 대신 해주실 분을 찾고 있어요. 😢🙏\n\n${statusLine}`;
+
+    const actionValue = JSON.stringify({ date, requester: requesterName, role });
     await client.chat.postMessage({
       channel: event.channel,
       thread_ts: threadTs,
-      text: `🙏 당번 교체 요청`,
+      text: `🙏 ${short} ${roleLabel} 당번 교체 요청`,
       blocks: [
-        { type: 'section', text: { type: 'mrkdwn', text: `🙏 *당번 교체 요청*\n\n*${label}* 당번을 대신 해주실 분 있으신가요?\n요청자: *${requesterName}* 님` } },
+        { type: 'section', text: { type: 'mrkdwn', text: bodyText } },
         { type: 'actions', elements: [
           { type: 'button', text: { type: 'plain_text', text: '✅ 수락' }, style: 'primary', action_id: 'duty_accept', value: actionValue },
           { type: 'button', text: { type: 'plain_text', text: '❌ 거절' }, style: 'danger', action_id: 'duty_decline', value: actionValue },
