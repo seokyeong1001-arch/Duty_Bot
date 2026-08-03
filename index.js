@@ -139,6 +139,7 @@ async function loadSheets() {
       loop: loopRows.map(r => ({ main: r['메인'], needCheck: r['크첵필요'] === 'O' })),
       checkLoop: checkRows.map(r => ({ check: r['크첵'] })),
     };
+    invalidateRotation();
 
     console.log(
       `[시트 캐시] 갱신 완료 — 멤버 ${Object.keys(members).length}명 / ` +
@@ -355,6 +356,7 @@ async function loadPersisted() {
 
     // 연차
     for (const k of Object.keys(leaves)) delete leaves[k];
+    invalidateRotation();
     const lv = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${LEAVE_TAB}!A2:C` });
     for (const row of (lv.data.values || [])) {
       const name = (row[0] || '').trim();
@@ -457,6 +459,7 @@ function isOnLeave(name, dateStr) {
 function addLeave(name, dates) {
   if (!leaves[name]) leaves[name] = new Set();
   for (const d of dates) leaves[name].add(d);
+  invalidateRotation();
 }
 
 function removeLeave(name, dates) {
@@ -464,6 +467,7 @@ function removeLeave(name, dates) {
   let count = 0;
   for (const d of dates) { if (leaves[name].delete(d)) count++; }
   if (leaves[name].size === 0) delete leaves[name];
+  if (count) invalidateRotation();
   return count;
 }
 
@@ -486,51 +490,143 @@ function dayDiff(dateStr) {
   return Math.round((target - start) / (1000 * 60 * 60 * 24));
 }
 
+// 루프 시작일 기준 n일째 날짜 문자열 (dayDiff의 역함수)
+function dateAtDiff(n) {
+  const d = new Date(sheetCache.startDate);
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+
+// ─── 연차 제외 로테이션 ───────────────────────────────
+// 연차자는 차례를 "소비하지 않고" 건너뛴다. 건너뛴 칸만큼 커서가 함께 진행하므로
+// 연차 기간에는 남은 인원만으로 순환한다.
+//   예) 루프 [A,B,C,D,E]에서 C가 연차면 → A → B → D → E → A → B → D …
+// 커서는 날짜순 누적 상태이므로 하루씩 시뮬레이션해서 캐시에 쌓는다.
+// (연차가 등록되기 전 구간은 커서 = 달력 인덱스라서 시뮬레이션 없이 바로 계산)
+let rotationVersion = 0;
+let rotationCache = null;
+
+function invalidateRotation() {
+  rotationVersion++;
+  rotationCache = null;
+}
+
+const EMPTY_ROTATION = { main: null, mainSub: false, check: null, checkSub: false };
+
+// 등록된 연차 중 가장 이른 날의 diff (연차 없으면 null)
+function earliestLeaveDiff() {
+  let min = null;
+  for (const name of Object.keys(leaves)) {
+    for (const d of leaves[name]) { if (min === null || d < min) min = d; }
+  }
+  if (min === null) return null;
+  return Math.max(0, dayDiff(min));
+}
+
+// 연차 영향이 없는 구간의 커서 = 달력 인덱스
+function baseCursors(diff) {
+  const { loop, checkLoop } = sheetCache;
+  const perCycle = loop.filter(r => r.needCheck).length;
+  const cycles = Math.floor(diff / loop.length);
+  const rest = loop.slice(0, diff % loop.length).filter(r => r.needCheck).length;
+  return {
+    main: diff % loop.length,
+    check: checkLoop.length ? (cycles * perCycle + rest) % checkLoop.length : 0,
+  };
+}
+
+function plainRotation(diff) {
+  const { loop, checkLoop } = sheetCache;
+  const idx = diff % loop.length;
+  const check = (loop[idx].needCheck && checkLoop.length)
+    ? (checkLoop[baseCursors(diff).check].check || null)
+    : null;
+  return { main: loop[idx].main || null, mainSub: false, check, checkSub: false };
+}
+
+// 커서를 하루 진행시키고 그날의 배정을 반환
+function stepRotation(n) {
+  const { loop, checkLoop } = sheetCache;
+  const L = loop.length;
+  const CL = checkLoop.length;
+  const ds = dateAtDiff(n);
+
+  // 메인 — 커서부터 연차가 아닌 첫 사람
+  let idx = -1;
+  let skip = 0;
+  for (; skip < L; skip++) {
+    const cand = loop[(rotationCache.mainCursor + skip) % L].main;
+    if (cand && !isOnLeave(cand, ds)) { idx = (rotationCache.mainCursor + skip) % L; break; }
+  }
+  if (idx < 0) { // 전원 연차
+    rotationCache.mainCursor = (rotationCache.mainCursor + 1) % L;
+    return { ...EMPTY_ROTATION };
+  }
+  const main = loop[idx].main;
+  rotationCache.mainCursor = (idx + 1) % L; // 건너뛴 칸까지 함께 소비
+
+  // 크첵 — 그날 메인의 '크첵필요' 여부로 판단, 크첵루프에서 연차자 건너뜀
+  let check = null;
+  let checkSub = false;
+  if (loop[idx].needCheck && CL) {
+    let cIdx = -1;
+    let cSkip = 0;
+    for (; cSkip < CL; cSkip++) {
+      const cand = checkLoop[(rotationCache.checkCursor + cSkip) % CL].check;
+      if (cand && !isOnLeave(cand, ds)) { cIdx = (rotationCache.checkCursor + cSkip) % CL; break; }
+    }
+    if (cIdx >= 0) {
+      check = checkLoop[cIdx].check;
+      checkSub = cSkip > 0;
+      rotationCache.checkCursor = (cIdx + 1) % CL; // 크첵 배정된 날만 진행
+    }
+  }
+  return { main, mainSub: skip > 0, check, checkSub };
+}
+
+function simulatedRotation(targetDiff) {
+  if (!rotationCache || rotationCache.version !== rotationVersion) {
+    const anchor = earliestLeaveDiff() || 0;
+    const base = baseCursors(anchor);
+    rotationCache = {
+      version: rotationVersion, next: anchor,
+      mainCursor: base.main, checkCursor: base.check,
+      map: new Map(),
+    };
+  }
+  for (let n = rotationCache.next; n <= targetDiff; n++) {
+    rotationCache.map.set(n, stepRotation(n));
+    rotationCache.next = n + 1;
+  }
+  return rotationCache.map.get(targetDiff) || { ...EMPTY_ROTATION };
+}
+
+function rotationFor(dateStr) {
+  const { loop, startDate } = sheetCache;
+  if (!startDate || !loop.length) return EMPTY_ROTATION;
+  const diff = dayDiff(dateStr);
+  if (diff < 0) return EMPTY_ROTATION;
+
+  const anchor = earliestLeaveDiff();
+  // 연차가 없거나 첫 연차보다 이전 날짜면 달력 인덱스 그대로
+  if (anchor === null || diff < anchor) return plainRotation(diff);
+  return simulatedRotation(diff);
+}
+
 function getMain(dateStr) {
   if (`${dateStr}:main` in overrides) {
     return { name: overrides[`${dateStr}:main`] || null, isSubstitute: false };
   }
-  const { loop, startDate } = sheetCache;
-  if (!startDate || !loop.length) return { name: null, isSubstitute: false };
-  const diff = dayDiff(dateStr);
-  if (diff < 0) return { name: null, isSubstitute: false };
-
-  const baseIdx = diff % loop.length;
-  for (let i = 0; i < loop.length; i++) {
-    const name = loop[(baseIdx + i) % loop.length].main;
-    if (!isOnLeave(name, dateStr)) {
-      return { name: name || null, isSubstitute: i > 0 };
-    }
-  }
-  return { name: null, isSubstitute: false };
+  const r = rotationFor(dateStr);
+  return { name: r.main, isSubstitute: r.mainSub };
 }
 
-// 크첵 계산 — needCheck 위치는 루프 순서 그대로 유지, 담당자만 연차 건너뜀
 function getCheck(dateStr) {
   if (`${dateStr}:check` in overrides) {
     return { name: overrides[`${dateStr}:check`] || null, isSubstitute: false };
   }
-  const { loop, checkLoop, startDate } = sheetCache;
-  if (!startDate || !loop.length || !checkLoop.length) return { name: null, isSubstitute: false };
-  const diff = dayDiff(dateStr);
-  if (diff < 0) return { name: null, isSubstitute: false };
-
-  const idx = diff % loop.length;
-  if (!loop[idx].needCheck) return { name: null, isSubstitute: false };
-
-  const numCheckPerCycle = loop.filter(r => r.needCheck).length;
-  const fullCycles = Math.floor(diff / loop.length);
-  const checksUpToIdx = loop.slice(0, idx + 1).filter(r => r.needCheck).length;
-  const totalCheckCount = fullCycles * numCheckPerCycle + checksUpToIdx;
-  const baseCheckIdx = (totalCheckCount - 1) % checkLoop.length;
-
-  for (let i = 0; i < checkLoop.length; i++) {
-    const name = checkLoop[(baseCheckIdx + i) % checkLoop.length].check;
-    if (!isOnLeave(name, dateStr)) {
-      return { name: name || null, isSubstitute: i > 0 };
-    }
-  }
-  return { name: null, isSubstitute: false };
+  const r = rotationFor(dateStr);
+  return { name: r.check, isSubstitute: r.checkSub };
 }
 
 function mentionTag(name) {
@@ -1117,11 +1213,20 @@ app.event('app_mention', async ({ event, client, say }) => {
 });
 
 // ─── 서버 시작 ────────────────────────────────────────
-(async () => {
-  await loadSheets();
-  await loadPersisted();
-  await app.start(process.env.PORT || 3000);
-  const authResult = await app.client.auth.test();
-  botUserId = authResult.user_id;
-  console.log('⚡ 당번 봇이 실행 중입니다! Bot ID:', botUserId);
-})();
+if (require.main === module) {
+  (async () => {
+    await loadSheets();
+    await loadPersisted();
+    await app.start(process.env.PORT || 3000);
+    const authResult = await app.client.auth.test();
+    botUserId = authResult.user_id;
+    console.log('⚡ 당번 봇이 실행 중입니다! Bot ID:', botUserId);
+  })();
+}
+
+// 검증 스크립트용 (require 했을 때만 사용, 봇 실행에는 영향 없음)
+module.exports = {
+  getMain, getCheck, addLeave, removeLeave, isOnLeave,
+  _setSheetCache: (c) => { sheetCache = c; invalidateRotation(); },
+  _resetLeaves: () => { for (const k of Object.keys(leaves)) delete leaves[k]; invalidateRotation(); },
+};
