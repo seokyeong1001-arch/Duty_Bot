@@ -378,6 +378,11 @@ const app = new App({
   signingSecret: process.env.SLACK_SIGNING_SECRET,
 });
 
+// 리스너에서 처리 못 하고 올라온 에러는 여기서 반드시 로그로 남긴다
+app.error(async (error) => {
+  console.error('[Bolt] 처리되지 않은 에러:', error);
+});
+
 const CONFIG = {
   notifyChannel: process.env.SLACK_CHANNEL,
   notifyTime: '30 7 * * *',
@@ -1049,7 +1054,46 @@ cron.schedule(CONFIG.eveningNotifyTime, async () => {
 }, { timezone: 'Asia/Seoul' });
 
 // ─── @당번봇 멘션 처리 ────────────────────────────────
+// 어떤 경로로 빠져나가든 사용자에게 응답이 가도록 래퍼로 감싼다
 app.event('app_mention', async ({ event, client, say }) => {
+  const threadTs = event.thread_ts || event.ts;
+  console.log(`[멘션] 수신 user=${event.user} ch=${event.channel} thread=${threadTs} text="${event.text}"`);
+  try {
+    await handleMention({ event, client, say });
+    console.log(`[멘션] 처리 완료 user=${event.user}`);
+  } catch (e) {
+    console.error(`[멘션] 처리 실패 user=${event.user} text="${event.text}":`, e);
+    try {
+      await say({
+        text: `⚠️ 명령을 처리하다 오류가 났어요.\n\`\`\`${e.data?.error || e.message}\`\`\`\n잠시 후 다시 시도하거나 \`@당번봇 캐시갱신\` 후 재시도해주세요.`,
+        thread_ts: threadTs,
+      });
+    } catch (e2) {
+      console.error('[멘션] 오류 응답조차 실패:', e2.data?.error || e2.message);
+    }
+  }
+});
+
+// 나에게만 보이는 메시지. 스레드에서도 보이도록 thread_ts를 넣고,
+// 실패하면 스레드 메시지로 폴백해서 "무응답"이 되지 않게 한다.
+async function replyEphemeral({ client, say, event, threadTs, text, blocks }) {
+  const payload = { channel: event.channel, user: event.user, thread_ts: threadTs, text };
+  if (blocks) payload.blocks = blocks;
+  try {
+    await client.chat.postEphemeral(payload);
+    console.log(`[응답] ephemeral 전송 성공 user=${event.user} ch=${event.channel}`);
+    return true;
+  } catch (e) {
+    console.error(`[응답] ephemeral 전송 실패 (${e.data?.error || e.message}) — 스레드 메시지로 폴백`);
+    const fallback = { text, thread_ts: threadTs };
+    if (blocks) fallback.blocks = blocks;
+    await say(fallback);
+    console.log(`[응답] 폴백 스레드 메시지 전송 완료 user=${event.user}`);
+    return false;
+  }
+}
+
+async function handleMention({ event, client, say }) {
   const text = event.text.replace(/<@[A-Z0-9]+>/g, '').trim();
   const parts = text.split(/\s+/).filter(Boolean);
   const cmd = parts[0];
@@ -1140,23 +1184,43 @@ app.event('app_mention', async ({ event, client, say }) => {
 
   // 요청 MM.DD — 본인 역할(메인/크첵) 자동 구분 후 요청 방식 선택 (나에게만 표시)
   if (cmd === '요청') {
+    console.log(`[요청] 1/4 진입 user=${event.user} args=${JSON.stringify(parts.slice(1))}`);
+
     const date = parseDate(parts[1] || '');
-    if (!date) { await reply('❌ 사용법: `@당번봇 요청 MM.DD`'); return; }
+    if (!date) {
+      console.log(`[요청] 중단 — 날짜 파싱 실패 input="${parts[1] || '(없음)'}"`);
+      await reply('❌ 사용법: `@당번봇 요청 MM.DD` (예: `@당번봇 요청 08.11`)');
+      return;
+    }
+    console.log(`[요청] 2/4 날짜 파싱 완료 date=${date}`);
 
     const requesterName = memberNameById(event.user);
+    console.log(`[요청] 3/4 요청자 조회 user=${event.user} → name=${requesterName || 'null'} (멤버 시트 ${Object.keys(sheetCache.members).length}명 로드됨)`);
+    if (!requesterName) {
+      // 예전엔 여기서 role=null로 흡수돼 원인을 알 수 없었다 — 이제 별도로 안내한다
+      await replyEphemeral({
+        client, say, event, threadTs,
+        text: `❌ 멤버 시트에서 <@${event.user}> 님을 찾지 못했어요.\n시트의 슬랙ID 열을 확인하시고, 방금 수정했다면 \`@당번봇 캐시갱신\` 후 다시 시도해주세요.`,
+      });
+      return;
+    }
+
+    const mainName = getMain(date).name || '—';
+    const checkName = getCheck(date).name || '—';
     const role = requesterRole(date, requesterName);
+    console.log(`[요청] 4/4 역할 판별 date=${date} 요청자=${requesterName} 메인=${mainName} 크첵=${checkName} → role=${role || 'null'}`);
     if (!role) {
-      await client.chat.postEphemeral({
-        channel: event.channel, user: event.user,
-        text: `❌ ${dateLabel(date)} 당번자가 아니에요. 본인 당번날만 요청할 수 있어요.`,
+      await replyEphemeral({
+        client, say, event, threadTs,
+        text: `❌ ${dateLabel(date)} 당번자가 아니에요. 본인 당번날만 요청할 수 있어요.\n(그날 당번: 메인 *${mainName}* / 크첵 *${checkName}*)`,
       });
       return;
     }
 
     const roleLabel = role === 'main' ? '메인' : '크첵';
     const val = JSON.stringify({ date, role });
-    await client.chat.postEphemeral({
-      channel: event.channel, user: event.user,
+    await replyEphemeral({
+      client, say, event, threadTs,
       text: `${dateLabel(date)} ${roleLabel} 당번 요청`,
       blocks: [
         { type: 'section', text: { type: 'mrkdwn', text: `🙏 *${dateLabel(date)}* ${roleLabel} 당번 요청\n어떤 방식으로 요청할까요?` } },
@@ -1166,6 +1230,7 @@ app.event('app_mention', async ({ event, client, say }) => {
         ]},
       ],
     });
+    console.log(`[요청] 완료 — 방식 선택 버튼 전송 date=${date} role=${role}`);
     return;
   }
 
@@ -1209,8 +1274,9 @@ app.event('app_mention', async ({ event, client, say }) => {
     await reply(`📅 *${dateLabel(dateQuery)}* 당번: ${line} 님`); return;
   }
 
+  console.log(`[멘션] 매칭되는 명령어 없음 cmd="${cmd}"`);
   await reply(`❓ 모르는 명령어예요. \`@당번봇 매뉴얼\` 로 사용법을 확인해주세요!`);
-});
+}
 
 // ─── 서버 시작 ────────────────────────────────────────
 if (require.main === module) {
