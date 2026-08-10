@@ -770,6 +770,16 @@ async function ensureWeeklyThread() {
   return res.ts;
 }
 
+// 주간 스레드에 답글로 게시한다. 스레드가 없으면 ensureWeeklyThread() 로 먼저 확보.
+async function postWeeklyReply({ text, blocks }) {
+  const weeklyTs = await ensureWeeklyThread();
+  const payload = { channel: CONFIG.notifyChannel, thread_ts: weeklyTs, text };
+  if (blocks) payload.blocks = blocks;
+  const res = await app.client.chat.postMessage(payload);
+  console.log(`[주간스레드] 답글 게시 thread_ts=${weeklyTs} ts=${res.ts}`);
+  return { weeklyTs, ts: res.ts };
+}
+
 // ─── 매뉴얼 ───────────────────────────────────────────
 const MANUAL_TEXT = `📖 *당번봇 매뉴얼*
 
@@ -828,7 +838,24 @@ function randomDecline(name) {
   return DECLINE_LINES[Math.floor(Math.random() * DECLINE_LINES.length)](name);
 }
 
-// ─── 요청 방식: 대리 요청 (채널 공지) ────────────────
+// 버튼이 달렸던 원본 메시지를 결과 텍스트로 교체한다.
+// 방식 선택 메시지가 ephemeral 이 아닌 주간 스레드의 실제 메시지가 됐으므로
+// respond(replace_original) 대신 chat.update 를 쓰고, 실패 시에만 respond 로 폴백한다.
+async function replaceSourceMessage({ body, client, respond, text }) {
+  try {
+    await client.chat.update({
+      channel: body.channel.id, ts: body.message.ts, text, blocks: [
+        { type: 'section', text: { type: 'mrkdwn', text } },
+      ],
+    });
+    console.log(`[요청] 원본 메시지 교체 완료 ts=${body.message.ts}`);
+  } catch (e) {
+    console.error(`[요청] 원본 메시지 교체 실패 (${e.data?.error || e.message}) — respond 로 폴백`);
+    await respond({ replace_original: true, text });
+  }
+}
+
+// ─── 요청 방식: 대리 요청 (주간 스레드 공지) ──────────
 app.action('req_delegate', async ({ body, ack, client, respond }) => {
   await ack();
   const { date, role } = JSON.parse(body.actions[0].value);
@@ -843,8 +870,7 @@ app.action('req_delegate', async ({ body, ack, client, respond }) => {
   const tagText = tagNames.map(n => mentionTag(n)).join(' ');
 
   const actionValue = JSON.stringify({ date, requester: requesterName, role });
-  await client.chat.postMessage({
-    channel: body.channel.id,
+  await postWeeklyReply({
     text: `🙏 ${dateLabel(date)} ${roleLabel} 당번 교체 요청`,
     blocks: [
       { type: 'section', text: { type: 'mrkdwn', text: `${tagText}\n${requesterName} 님이 ${dateLabel(date)} ${roleLabel} 당번을 대신 해주실 분을 찾고 있어요. 😢🙏` } },
@@ -854,7 +880,7 @@ app.action('req_delegate', async ({ body, ack, client, respond }) => {
       ]},
     ],
   });
-  await respond({ replace_original: true, text: `✅ 채널에 *${dateLabel(date)}* ${roleLabel} 대리 요청을 올렸어요.` });
+  await replaceSourceMessage({ body, client, respond, text: `✅ *${dateLabel(date)}* ${roleLabel} 대리 요청을 주간 스레드에 올렸어요.` });
 });
 
 // ─── 요청 방식: 날짜 교체 (모달로 날짜 입력) ──────────
@@ -878,12 +904,13 @@ app.action('req_swap', async ({ body, ack, client, respond }) => {
       ],
     },
   });
-  await respond({ replace_original: true, text: '🔄 날짜 교체 요청 창을 열었어요. (창에서 날짜를 입력하세요)' });
+  await replaceSourceMessage({ body, client, respond, text: '🔄 날짜 교체 요청 창을 열었어요. (창에서 날짜를 입력하세요)' });
 });
 
 // 날짜 교체 모달 제출 → 상대 당번에게 태그해 채널 공지
 app.view('swap_modal', async ({ body, ack, view, client }) => {
-  const { date, role, channel } = JSON.parse(view.private_metadata);
+  // channel 은 더 이상 쓰지 않는다 — 공지는 항상 주간 스레드로 간다
+  const { date, role } = JSON.parse(view.private_metadata);
   const raw = (view.state.values['swap_date']?.['picked']?.value || '').trim();
   const date2 = parseDate(raw);
   if (!date2) { await ack({ response_action: 'errors', errors: { swap_date: '날짜 형식은 MM.DD 예요 (예: 07.21)' } }); return; }
@@ -899,8 +926,7 @@ app.view('swap_modal', async ({ body, ack, view, client }) => {
 
   const requesterName = memberNameById(body.user.id) || await getRealName(app.client, body.user.id);
   const actionValue = JSON.stringify({ date, date2, role, requester: requesterName, counterpart });
-  await client.chat.postMessage({
-    channel,
+  await postWeeklyReply({
     text: `🔄 ${dateLabel(date)} ↔ ${dateLabel(date2)} 날짜 교체 요청`,
     blocks: [
       { type: 'section', text: { type: 'mrkdwn', text: `${mentionTag(counterpart)}\n${requesterName} 님이 날짜 교체를 요청해요. 😢🙏\n${dateLabel(date)} ${requesterName} ↔ ${dateLabel(date2)} ${counterpart}` } },
@@ -925,12 +951,16 @@ app.action('delegate_accept', async ({ body, ack, client }) => {
     blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `✅ *${dateLabel(date)}* ${roleLabel} 당번이 ${acceptor} 님으로 변경됐어요. ${requester} → ${acceptor}` } }],
   });
   await updateWeeklyThread();
+  console.log(`[대리요청] 수락 date=${date} role=${role} ${requester} → ${acceptor}`);
 });
 
-app.action('delegate_decline', async ({ body, ack, client }) => {
+app.action('delegate_decline', async ({ body, ack }) => {
   await ack();
   const decliner = memberNameById(body.user.id) || await getRealName(app.client, body.user.id);
-  await client.chat.postMessage({ channel: body.channel.id, thread_ts: body.message.ts, text: randomDecline(decliner) });
+  // 요청 메시지가 이미 주간 스레드 안에 있으므로 그 ts 를 thread_ts 로 쓰면
+  // 스레드 중첩이 된다 — 주간 스레드에 직접 답글로 단다
+  await postWeeklyReply({ text: randomDecline(decliner) });
+  console.log(`[대리요청] 거절 user=${body.user.id} name=${decliner}`);
 });
 
 // ─── 날짜 교체 수락/거절 ──────────────────────────────
@@ -947,12 +977,14 @@ app.action('swap_accept', async ({ body, ack, client }) => {
     blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `✅ *${dateLabel(date)}* ↔ *${dateLabel(date2)}* 교체 완료! ${requester} ↔ ${counterpart}` } }],
   });
   await updateWeeklyThread();
+  console.log(`[날짜교체] 수락 ${date} ↔ ${date2} role=${role} ${requester} ↔ ${counterpart}`);
 });
 
-app.action('swap_decline', async ({ body, ack, client }) => {
+app.action('swap_decline', async ({ body, ack }) => {
   await ack();
   const decliner = memberNameById(body.user.id) || await getRealName(app.client, body.user.id);
-  await client.chat.postMessage({ channel: body.channel.id, thread_ts: body.message.ts, text: randomDecline(decliner) });
+  await postWeeklyReply({ text: randomDecline(decliner) });
+  console.log(`[날짜교체] 거절 user=${body.user.id} name=${decliner}`);
 });
 
 // ─── 이번달 주차 선택 버튼 ────────────────────────────
@@ -1101,6 +1133,18 @@ async function handleMention({ event, client, say }) {
 
   const reply = async (msg) => { await say({ text: msg, thread_ts: threadTs }); };
 
+  // 결과는 주간 스레드에 답글로 남긴다. 명령을 다른 곳에서 쳤다면
+  // 무응답으로 보이지 않도록 그 자리에도 위치를 알려준다.
+  const replyWeekly = async (msg, blocks) => {
+    const { weeklyTs } = await postWeeklyReply({ text: msg, blocks });
+    if (event.channel !== CONFIG.notifyChannel || threadTs !== weeklyTs) {
+      await replyEphemeral({
+        client, say, event, threadTs,
+        text: '✅ 처리했어요. 결과는 *주간 당번 일정* 스레드에 답글로 올렸어요.',
+      });
+    }
+  };
+
   // 매뉴얼 (빈 멘션 포함)
   if (!cmd || cmd === '매뉴얼') {
     await reply(MANUAL_TEXT); return;
@@ -1154,14 +1198,14 @@ async function handleMention({ event, client, say }) {
       await syncOverrideRow(date);
       await updateWeeklyThread();
       const beforeStr = (prevCheck && prevCheck !== 'NONE') ? `${prevMain}(${prevCheck})` : prevMain;
-      await reply(`✅ *${dateLabel(date)}* ${beforeStr} → ${mainName}(${checkName}) 으로 변경했어요.`);
+      await replyWeekly(`✅ *${dateLabel(date)}* ${beforeStr} → ${mainName}(${checkName}) 으로 변경했어요.`);
       return;
     }
     overrides[`${date}:main`] = nameInput;
     delete overrides[`${date}:check`];
     await syncOverrideRow(date);
     await updateWeeklyThread();
-    await reply(`✅ *${dateLabel(date)}* ${prevMain} → ${nameInput} 으로 변경했어요.`);
+    await replyWeekly(`✅ *${dateLabel(date)}* ${prevMain} → ${nameInput} 으로 변경했어요.`);
     return;
   }
 
@@ -1175,7 +1219,7 @@ async function handleMention({ event, client, say }) {
     if (removed.length > 0) {
       await syncOverrideRow(date);
       await updateWeeklyThread();
-      await reply(`↩️ *${dateLabel(date)}* 변경을 취소했어요.`);
+      await replyWeekly(`↩️ *${dateLabel(date)}* 변경을 취소했어요.`);
     } else {
       await reply(`ℹ️ 변경된 내용이 없어요.`);
     }
@@ -1219,18 +1263,15 @@ async function handleMention({ event, client, say }) {
 
     const roleLabel = role === 'main' ? '메인' : '크첵';
     const val = JSON.stringify({ date, role });
-    await replyEphemeral({
-      client, say, event, threadTs,
-      text: `${dateLabel(date)} ${roleLabel} 당번 요청`,
-      blocks: [
-        { type: 'section', text: { type: 'mrkdwn', text: `🙏 *${dateLabel(date)}* ${roleLabel} 당번 요청\n어떤 방식으로 요청할까요?` } },
-        { type: 'actions', elements: [
-          { type: 'button', text: { type: 'plain_text', text: '🙋 대리 요청' }, style: 'primary', action_id: 'req_delegate', value: val },
-          { type: 'button', text: { type: 'plain_text', text: '🔄 날짜 교체' }, action_id: 'req_swap', value: val },
-        ]},
-      ],
-    });
-    console.log(`[요청] 완료 — 방식 선택 버튼 전송 date=${date} role=${role}`);
+    // 주간 스레드에 올라가는 공개 메시지이므로 누구의 요청인지 함께 표시한다
+    await replyWeekly(`${requesterName} 님의 ${dateLabel(date)} ${roleLabel} 당번 요청`, [
+      { type: 'section', text: { type: 'mrkdwn', text: `🙏 ${mentionTag(requesterName)} 님의 *${dateLabel(date)}* ${roleLabel} 당번 요청\n어떤 방식으로 요청할까요?` } },
+      { type: 'actions', elements: [
+        { type: 'button', text: { type: 'plain_text', text: '🙋 대리 요청' }, style: 'primary', action_id: 'req_delegate', value: val },
+        { type: 'button', text: { type: 'plain_text', text: '🔄 날짜 교체' }, action_id: 'req_swap', value: val },
+      ]},
+    ]);
+    console.log(`[요청] 완료 — 방식 선택 버튼을 주간 스레드에 전송 date=${date} role=${role}`);
     return;
   }
 
@@ -1241,7 +1282,7 @@ async function handleMention({ event, client, say }) {
     const { name, dates, rangeStr } = parsed;
     addLeave(name, dates);
     await persistLeaveAdd(name, dates[0], dates[dates.length - 1]);
-    await reply(`🏖️ *${name}* 님 연차 등록 완료 (${rangeStr}, ${dates.length}일)`);
+    await replyWeekly(`🏖️ *${name}* 님 연차 등록 완료 (${rangeStr}, ${dates.length}일)`);
     return;
   }
 
@@ -1253,7 +1294,7 @@ async function handleMention({ event, client, say }) {
     const removed = removeLeave(name, dates);
     if (removed > 0) {
       await persistLeaveRemove(name, dates[0], dates[dates.length - 1]);
-      await reply(`↩️ *${name}* 님 연차 취소 완료 (${rangeStr}, ${removed}일)`);
+      await replyWeekly(`↩️ *${name}* 님 연차 취소 완료 (${rangeStr}, ${removed}일)`);
     } else {
       await reply(`ℹ️ *${name}* 님의 해당 날짜 연차가 없어요.`);
     }
