@@ -66,8 +66,10 @@ async function setThreadTs(ts) {
 
 // ─── Google Sheets CSV ────────────────────────────────
 const SHEET_ID = '1AJ297G3fIa_P4qcF1vrC3aTsJNjC6baKvsmSrD1Wh_4';
+// gviz CSV 응답에는 CDN 캐시가 붙어 방금 고친 시트가 옛 값으로 돌아올 수 있다.
+// 요청마다 캐시 버스터를 붙이고 fetch도 no-store로 보낸다.
 const sheetUrl = (tab) =>
-  `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(tab)}`;
+  `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(tab)}&_cb=${Date.now()}`;
 
 // ─── 영구 저장 탭 ─────────────────────────────────────
 const OVERRIDE_TAB = '변경'; // 날짜 | 메인 | 크첵
@@ -116,9 +118,9 @@ let sheetCache = { members: {}, loop: [], checkLoop: [], startDate: '' };
 async function loadSheets() {
   try {
     const [memberRes, loopRes, checkRes] = await Promise.all([
-      fetch(sheetUrl('멤버')),
-      fetch(sheetUrl('루프')),
-      fetch(sheetUrl('크첵루프')),
+      fetch(sheetUrl('멤버'), { cache: 'no-store' }),
+      fetch(sheetUrl('루프'), { cache: 'no-store' }),
+      fetch(sheetUrl('크첵루프'), { cache: 'no-store' }),
     ]);
     const [memberText, loopText, checkText] = await Promise.all([
       memberRes.text(), loopRes.text(), checkRes.text(),
@@ -139,7 +141,6 @@ async function loadSheets() {
       loop: loopRows.map(r => ({ main: r['메인'], needCheck: r['크첵필요'] === 'O' })),
       checkLoop: checkRows.map(r => ({ check: r['크첵'] })),
     };
-    invalidateRotation();
 
     console.log(
       `[시트 캐시] 갱신 완료 — 멤버 ${Object.keys(members).length}명 / ` +
@@ -148,6 +149,9 @@ async function loadSheets() {
     );
   } catch (e) {
     console.error('[시트 캐시] 로드 실패:', e.message);
+  } finally {
+    // 성공이든 실패든 파생 캐시는 버린다 — 다음 계산이 항상 현재 sheetCache로 재구성되도록
+    invalidateRotation();
   }
 }
 
@@ -366,10 +370,27 @@ async function loadPersisted() {
       addLeave(name, expandRange(start, end));
     }
 
-    console.log(`[영구저장] 로드 완료 — 변경 ${Object.keys(overrides).length}건 / 연차 ${Object.keys(leaves).length}명`);
+    console.log(
+      `[영구저장] 로드 완료 — 변경 ${Object.keys(overrides).length}건(유효 ${upcomingOverrideCount()}건) / ` +
+      `연차 ${Object.keys(leaves).length}명(유효 ${upcomingLeaveCount()}명)`
+    );
   } catch (e) {
     console.error('[영구저장] 로드 실패:', e.message);
+  } finally {
+    // 중간에 실패해 부분 상태로 남았더라도 파생 캐시는 남기지 않는다
+    invalidateRotation();
   }
+}
+
+// 시트 → 메모리 → 파생 캐시 → 게시된 주간 스레드까지 한 번에 재구성한다.
+// 파생 캐시(연차 커서 시뮬레이션)를 앞뒤로 두 번 버려서, 로드 도중 들어온 조회가
+// 옛 커서를 되살려 캐시에 남기는 경우까지 막는다.
+async function refreshAll({ updateThread = true } = {}) {
+  invalidateRotation();
+  await loadSheets();
+  await loadPersisted();
+  invalidateRotation();
+  if (updateThread) await updateWeeklyThread();
 }
 
 // ─── 앱 ───────────────────────────────────────────────
@@ -485,6 +506,30 @@ function leaveListText() {
     return `• *${name}*: ${dates}`;
   });
   return `📋 *등록된 연차 목록*\n\n${lines.join('\n')}`;
+}
+
+// ─── 유효(오늘 이후) 건수 집계 ─────────────────────────
+// 변경/연차 데이터는 과거 조회용으로 전부 메모리에 들고 있지만,
+// 캐시갱신 응답에는 아직 유효한 건수만 보여준다 (오늘 포함, Asia/Seoul 기준).
+
+// 날짜가 오늘 이후인 변경 건수 — 같은 날의 메인/크첵은 1건으로 센다
+function upcomingOverrideCount() {
+  const today = todayStr();
+  const dates = new Set();
+  for (const key of Object.keys(overrides)) {
+    const date = key.slice(0, key.lastIndexOf(':'));
+    if (date >= today) dates.add(date);
+  }
+  return dates.size;
+}
+
+// 종료일이 오늘 이후인 연차 인원 수 (연차는 날짜 Set이라 마지막 날짜가 종료일)
+function upcomingLeaveCount() {
+  const today = todayStr();
+  return Object.keys(leaves).filter(name => {
+    for (const d of leaves[name]) { if (d >= today) return true; }
+    return false;
+  }).length;
 }
 
 // ─── 당번 계산 ────────────────────────────────────────
@@ -1153,9 +1198,8 @@ async function handleMention({ event, client, say }) {
   // 캐시갱신
   if (cmd === '캐시갱신') {
     await reply('🔄 시트 캐시 갱신 중...');
-    await loadSheets();
-    await loadPersisted();
-    await reply(`✅ 캐시 갱신 완료! 멤버 ${Object.keys(sheetCache.members).length}명 / 루프 ${sheetCache.loop.length}칸 / 크첵루프 ${sheetCache.checkLoop.length}칸 / 변경 ${Object.keys(overrides).length ? Object.keys(overrides).filter(k => k.endsWith(':main')).length : 0}건 / 연차 ${Object.keys(leaves).length}명`);
+    await refreshAll();
+    await reply(`✅ 캐시 갱신 완료! 멤버 ${Object.keys(sheetCache.members).length}명 / 루프 ${sheetCache.loop.length}칸 / 크첵루프 ${sheetCache.checkLoop.length}칸 / 변경 ${upcomingOverrideCount()}건 / 연차 ${upcomingLeaveCount()}명`);
     return;
   }
 
@@ -1322,8 +1366,7 @@ async function handleMention({ event, client, say }) {
 // ─── 서버 시작 ────────────────────────────────────────
 if (require.main === module) {
   (async () => {
-    await loadSheets();
-    await loadPersisted();
+    await refreshAll({ updateThread: false });
     await app.start(process.env.PORT || 3000);
     const authResult = await app.client.auth.test();
     botUserId = authResult.user_id;
@@ -1334,6 +1377,11 @@ if (require.main === module) {
 // 검증 스크립트용 (require 했을 때만 사용, 봇 실행에는 영향 없음)
 module.exports = {
   getMain, getCheck, addLeave, removeLeave, isOnLeave,
+  upcomingOverrideCount, upcomingLeaveCount,
+  _setOverrides: (o) => {
+    for (const k of Object.keys(overrides)) delete overrides[k];
+    Object.assign(overrides, o);
+  },
   _setSheetCache: (c) => { sheetCache = c; invalidateRotation(); },
   _resetLeaves: () => { for (const k of Object.keys(leaves)) delete leaves[k]; invalidateRotation(); },
 };
