@@ -23,7 +23,9 @@ function hasRailwayCreds() {
   return !!(process.env.RAILWAY_API_TOKEN && projectId && environmentId && serviceId);
 }
 
-async function getThreadTs() {
+// 팀별 주간 스레드 ts 는 Railway 변수 team.threadVar 에 둔다.
+// 아직 팀별 변수가 없으면 legacyThreadVar(구 WEEKLY_THREAD_TS)로 폴백한다 — 파인트팀만 해당.
+async function getThreadTs(team) {
   if (!hasRailwayCreds()) return null;
   const { projectId, environmentId, serviceId } = railwayIds();
   const res = await fetch('https://backboard.railway.app/graphql/v2', {
@@ -40,10 +42,11 @@ async function getThreadTs() {
   });
   const json = await res.json();
   if (json.errors) throw new Error(json.errors[0].message);
-  return json.data.variables?.WEEKLY_THREAD_TS || null;
+  const vars = json.data.variables || {};
+  return vars[team.threadVar] || (team.legacyThreadVar && vars[team.legacyThreadVar]) || null;
 }
 
-async function setThreadTs(ts) {
+async function setThreadTs(team, ts) {
   if (!hasRailwayCreds()) return;
   const { projectId, environmentId, serviceId } = railwayIds();
   const res = await fetch('https://backboard.railway.app/graphql/v2', {
@@ -56,7 +59,7 @@ async function setThreadTs(ts) {
         }
       `,
       variables: {
-        input: { projectId, environmentId, serviceId, name: 'WEEKLY_THREAD_TS', value: ts },
+        input: { projectId, environmentId, serviceId, name: team.threadVar, value: ts },
       },
     }),
   });
@@ -71,13 +74,50 @@ const SHEET_ID = '1AJ297G3fIa_P4qcF1vrC3aTsJNjC6baKvsmSrD1Wh_4';
 const sheetUrl = (tab) =>
   `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(tab)}&_cb=${Date.now()}`;
 
-// ─── 영구 저장 탭 ─────────────────────────────────────
-const OVERRIDE_TAB = '변경'; // 날짜 | 메인 | 크첵
-const LEAVE_TAB = '연차';    // 이름 | 시작일 | 종료일
-// 최초 탭 생성 시 이관할 기존 변경값 (메모리 → 시트 1회성 시드)
-const SEED_OVERRIDES = [
-  { date: '2026-07-14', main: '손유곤', check: '문선정' },
+// ─── 팀 ───────────────────────────────────────────────
+// 팀은 채널로 구분한다. 시트 탭·스레드 ts·캐시·변경·연차가 전부 팀 단위로 독립이다.
+//   탭: <접두어>_루프 / _크첵루프 / _멤버 / _변경(날짜|메인|크첵) / _연차(이름|시작일|종료일)
+function createTeam({ key, label, prefix, channel, threadVar, legacyThreadVar = null, seedOverrides = [] }) {
+  return {
+    key, label, channel, threadVar, legacyThreadVar,
+    tabs: {
+      member: `${prefix}_멤버`,
+      loop: `${prefix}_루프`,
+      checkLoop: `${prefix}_크첵루프`,
+      override: `${prefix}_변경`,
+      leave: `${prefix}_연차`,
+    },
+    // 변경 탭을 새로 만들 때만 넣는 1회성 시드 (메모리 → 시트 이관용)
+    seedOverrides,
+    sheetCache: { members: {}, loop: [], checkLoop: [], startDate: '' },
+    overrides: {},
+    leaves: {}, // { '이름': Set<'YYYY-MM-DD'> }
+    rotationVersion: 0,
+    rotationCache: null,
+  };
+}
+
+const TEAMS = [
+  createTeam({
+    key: 'pint', label: '파인트팀', prefix: '파인트',
+    channel: process.env.SLACK_CHANNEL_PINT || process.env.SLACK_CHANNEL,
+    threadVar: 'WEEKLY_THREAD_TS_PINT', legacyThreadVar: 'WEEKLY_THREAD_TS',
+    seedOverrides: [{ date: '2026-07-14', main: '손유곤', check: '문선정' }],
+  }),
+  createTeam({
+    key: 'stick', label: '스틱바팀', prefix: '스틱바',
+    channel: process.env.SLACK_CHANNEL_STICK || 'C0B659HEYDV',
+    threadVar: 'WEEKLY_THREAD_TS_STICK',
+  }),
 ];
+
+function teamByChannel(channelId) {
+  if (!channelId) return null;
+  return TEAMS.find(t => t.channel && t.channel === channelId) || null;
+}
+
+const UNREGISTERED_CHANNEL_TEXT =
+  '이 채널은 당번봇에 등록되어 있지 않아요. 파인트팀 또는 스틱바팀 채널에서 사용해주세요.';
 
 function parseLine(line) {
   const result = [];
@@ -113,46 +153,78 @@ function parseCSV(text) {
 }
 
 // ─── 시트 캐시 ────────────────────────────────────────
-let sheetCache = { members: {}, loop: [], checkLoop: [], startDate: '' };
-
-async function loadSheets() {
+// gviz 는 없는 탭 이름을 받으면 에러 대신 "첫 번째 탭"을 돌려준다.
+// 탭 이름이 틀리면 다른 팀 루프를 읽게 되므로, 자격증명이 있으면 탭 존재를 먼저 확인한다.
+async function existingTabTitles() {
+  if (!hasSheetsCreds()) return null;
   try {
-    const [memberRes, loopRes, checkRes] = await Promise.all([
-      fetch(sheetUrl('멤버'), { cache: 'no-store' }),
-      fetch(sheetUrl('루프'), { cache: 'no-store' }),
-      fetch(sheetUrl('크첵루프'), { cache: 'no-store' }),
-    ]);
-    const [memberText, loopText, checkText] = await Promise.all([
-      memberRes.text(), loopRes.text(), checkRes.text(),
-    ]);
+    const meta = await getSheetsClient().spreadsheets.get({ spreadsheetId: SHEET_ID });
+    return new Set(meta.data.sheets.map(s => s.properties.title));
+  } catch (e) {
+    console.error('[시트 캐시] 탭 목록 조회 실패:', e.message);
+    return null;
+  }
+}
 
-    const memberRows = parseCSV(memberText);
-    const loopRows   = parseCSV(loopText);
-    const checkRows  = parseCSV(checkText);
+async function fetchTabRows(tab, titles) {
+  if (titles && !titles.has(tab)) {
+    console.warn(`[시트 캐시] 탭 없음 — '${tab}' 를 빈 탭으로 취급`);
+    return [];
+  }
+  const res = await fetch(sheetUrl(tab), { cache: 'no-store' });
+  return parseCSV(await res.text());
+}
+
+async function loadSheets(team) {
+  try {
+    const titles = await existingTabTitles();
+    const [memberRows, loopRows, checkRows] = await Promise.all([
+      fetchTabRows(team.tabs.member, titles),
+      fetchTabRows(team.tabs.loop, titles),
+      fetchTabRows(team.tabs.checkLoop, titles),
+    ]);
 
     const members = {};
     for (const row of memberRows) {
       if (row['이름']) members[row['이름']] = row['슬랙ID'] || '';
     }
 
-    sheetCache = {
+    team.sheetCache = {
       members,
       startDate: loopRows[0]?.['시작일'] || '',
-      loop: loopRows.map(r => ({ main: r['메인'], needCheck: r['크첵필요'] === 'O' })),
-      checkLoop: checkRows.map(r => ({ check: r['크첵'] })),
+      // 메인이 비어 있는 행은 아직 채우지 않은 칸이라 루프에서 뺀다
+      loop: loopRows
+        .filter(r => r['메인'])
+        .map(r => ({ main: r['메인'], needCheck: r['크첵필요'] === 'O' })),
+      checkLoop: checkRows.filter(r => r['크첵']).map(r => ({ check: r['크첵'] })),
     };
 
     console.log(
-      `[시트 캐시] 갱신 완료 — 멤버 ${Object.keys(members).length}명 / ` +
-      `루프 ${sheetCache.loop.length}칸 / 크첵루프 ${sheetCache.checkLoop.length}칸 / ` +
-      `시작일 ${sheetCache.startDate}`
+      `[시트 캐시][${team.label}] 갱신 완료 — 멤버 ${Object.keys(members).length}명 / ` +
+      `루프 ${team.sheetCache.loop.length}칸 / 크첵루프 ${team.sheetCache.checkLoop.length}칸 / ` +
+      `시작일 ${team.sheetCache.startDate}`
     );
   } catch (e) {
-    console.error('[시트 캐시] 로드 실패:', e.message);
+    console.error(`[시트 캐시][${team.label}] 로드 실패:`, e.message);
   } finally {
     // 성공이든 실패든 파생 캐시는 버린다 — 다음 계산이 항상 현재 sheetCache로 재구성되도록
-    invalidateRotation();
+    invalidateRotation(team);
   }
+}
+
+// 운영 중인지: 루프에 사람이 있고 시작일이 오늘(또는 지정일) 이전이어야 한다.
+// 운영 전 팀은 자동 알림·주간 스레드 생성·조회를 하지 않는다.
+function isOperating(team, dateStr = todayStr()) {
+  const { loop, startDate } = team.sheetCache;
+  const start = normalizeDate(startDate);
+  return !!(loop.length && start && start <= dateStr);
+}
+
+function notOperatingText(team) {
+  const start = normalizeDate(team.sheetCache.startDate);
+  const when = (start && team.sheetCache.loop.length && start > todayStr())
+    ? ` (${dateLabel(start)} 시작 예정)` : '';
+  return `🕐 ${team.label}은 아직 당번 운영 전이에요${when}.\n시트를 채운 뒤 \`@당번봇 캐시갱신\` 하면 바로 시작돼요.`;
 }
 
 // ─── Google Sheets 쓰기 (googleapis) ──────────────────
@@ -195,8 +267,10 @@ function expandRange(startStr, endStr) {
   return dates;
 }
 
-// 두 탭이 없으면 생성하고 헤더/시드 보장, sheetId 매핑 저장
-async function ensureTabs() {
+// 팀의 변경/연차 탭이 없으면 생성하고 헤더/시드 보장, sheetId 매핑 저장
+async function ensureTabs(team) {
+  const OVERRIDE_TAB = team.tabs.override;
+  const LEAVE_TAB = team.tabs.leave;
   const sheets = getSheetsClient();
   const meta = await sheets.spreadsheets.get({ spreadsheetId: SHEET_ID });
   const bySheet = {};
@@ -221,13 +295,13 @@ async function ensureTabs() {
   await ensureHeader(LEAVE_TAB, ['이름', '시작일', '종료일']);
 
   // 변경 탭을 이번에 새로 만든 경우에만 기존 메모리 값 시드
-  if (created.includes(OVERRIDE_TAB) && SEED_OVERRIDES.length) {
+  if (created.includes(OVERRIDE_TAB) && team.seedOverrides.length) {
     await sheets.spreadsheets.values.append({
       spreadsheetId: SHEET_ID, range: `${OVERRIDE_TAB}!A1`,
       valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS',
-      requestBody: { values: SEED_OVERRIDES.map(o => [o.date, o.main, o.check || '']) },
+      requestBody: { values: team.seedOverrides.map(o => [o.date, o.main, o.check || '']) },
     });
-    console.log(`[영구저장] 변경 탭 생성 + 시드 ${SEED_OVERRIDES.length}건 입력`);
+    console.log(`[영구저장][${team.label}] 변경 탭 생성 + 시드 ${team.seedOverrides.length}건 입력`);
   }
 }
 
@@ -268,9 +342,11 @@ async function deleteRow(tab, dataRowIdx) {
   });
 }
 
-// 메모리 overrides 상태를 변경 탭 한 행에 반영 (없으면 삭제)
-async function syncOverrideRow(date) {
+// 팀의 메모리 overrides 상태를 변경 탭 한 행에 반영 (없으면 삭제)
+async function syncOverrideRow(team, date) {
   if (!hasSheetsCreds()) return;
+  const { overrides } = team;
+  const OVERRIDE_TAB = team.tabs.override;
   try {
     const hasMain = `${date}:main` in overrides;
     const hasCheck = `${date}:check` in overrides;
@@ -295,28 +371,29 @@ async function syncOverrideRow(date) {
       });
     }
   } catch (e) {
-    console.error('[영구저장] 변경 반영 실패:', e.message);
+    console.error(`[영구저장][${team.label}] 변경 반영 실패:`, e.message);
   }
 }
 
-// 연차 탭에 [이름, 시작일, 종료일] 한 행 추가
-async function persistLeaveAdd(name, startStr, endStr) {
+// 팀 연차 탭에 [이름, 시작일, 종료일] 한 행 추가
+async function persistLeaveAdd(team, name, startStr, endStr) {
   if (!hasSheetsCreds()) return;
   try {
     const sheets = getSheetsClient();
     await sheets.spreadsheets.values.append({
-      spreadsheetId: SHEET_ID, range: `${LEAVE_TAB}!A1`,
+      spreadsheetId: SHEET_ID, range: `${team.tabs.leave}!A1`,
       valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS',
       requestBody: { values: [[name, startStr, endStr]] },
     });
   } catch (e) {
-    console.error('[영구저장] 연차 등록 실패:', e.message);
+    console.error(`[영구저장][${team.label}] 연차 등록 실패:`, e.message);
   }
 }
 
-// 연차 탭에서 이름 일치 + 기간 겹치는 행 삭제
-async function persistLeaveRemove(name, startStr, endStr) {
+// 팀 연차 탭에서 이름 일치 + 기간 겹치는 행 삭제
+async function persistLeaveRemove(team, name, startStr, endStr) {
   if (!hasSheetsCreds()) return;
+  const LEAVE_TAB = team.tabs.leave;
   try {
     const sheets = getSheetsClient();
     const res = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${LEAVE_TAB}!A2:C` });
@@ -334,23 +411,24 @@ async function persistLeaveRemove(name, startStr, endStr) {
       await deleteRow(LEAVE_TAB, idx);
     }
   } catch (e) {
-    console.error('[영구저장] 연차 취소 실패:', e.message);
+    console.error(`[영구저장][${team.label}] 연차 취소 실패:`, e.message);
   }
 }
 
-// 서버 시작/캐시갱신 시 두 탭을 읽어 메모리에 로드
-async function loadPersisted() {
+// 서버 시작/캐시갱신 시 팀의 변경/연차 탭을 읽어 메모리에 로드
+async function loadPersisted(team) {
   if (!hasSheetsCreds()) {
-    console.warn('[영구저장] GOOGLE_SERVICE_ACCOUNT_JSON 미설정 — 메모리 전용 모드로 동작');
+    console.warn(`[영구저장][${team.label}] GOOGLE_SERVICE_ACCOUNT_JSON 미설정 — 메모리 전용 모드로 동작`);
     return;
   }
+  const { overrides, leaves } = team;
   try {
-    await ensureTabs();
+    await ensureTabs(team);
     const sheets = getSheetsClient();
 
     // 변경
     for (const k of Object.keys(overrides)) delete overrides[k];
-    const ov = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${OVERRIDE_TAB}!A2:C` });
+    const ov = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${team.tabs.override}!A2:C` });
     for (const row of (ov.data.values || [])) {
       const date = normalizeDate(row[0]);
       if (!date) continue;
@@ -360,37 +438,37 @@ async function loadPersisted() {
 
     // 연차
     for (const k of Object.keys(leaves)) delete leaves[k];
-    invalidateRotation();
-    const lv = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${LEAVE_TAB}!A2:C` });
+    invalidateRotation(team);
+    const lv = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${team.tabs.leave}!A2:C` });
     for (const row of (lv.data.values || [])) {
       const name = (row[0] || '').trim();
       const start = normalizeDate(row[1]);
       if (!name || !start) continue;
       const end = normalizeDate(row[2]) || start;
-      addLeave(name, expandRange(start, end));
+      addLeave(team, name, expandRange(start, end));
     }
 
     console.log(
-      `[영구저장] 로드 완료 — 변경 ${Object.keys(overrides).length}건(유효 ${upcomingOverrideCount()}건) / ` +
-      `연차 ${Object.keys(leaves).length}명(유효 ${upcomingLeaveCount()}명)`
+      `[영구저장][${team.label}] 로드 완료 — 변경 ${Object.keys(overrides).length}건(유효 ${upcomingOverrideCount(team)}건) / ` +
+      `연차 ${Object.keys(leaves).length}명(유효 ${upcomingLeaveCount(team)}명)`
     );
   } catch (e) {
-    console.error('[영구저장] 로드 실패:', e.message);
+    console.error(`[영구저장][${team.label}] 로드 실패:`, e.message);
   } finally {
     // 중간에 실패해 부분 상태로 남았더라도 파생 캐시는 남기지 않는다
-    invalidateRotation();
+    invalidateRotation(team);
   }
 }
 
-// 시트 → 메모리 → 파생 캐시 → 게시된 주간 스레드까지 한 번에 재구성한다.
+// 팀 하나를 시트 → 메모리 → 파생 캐시 → 게시된 주간 스레드까지 한 번에 재구성한다.
 // 파생 캐시(연차 커서 시뮬레이션)를 앞뒤로 두 번 버려서, 로드 도중 들어온 조회가
 // 옛 커서를 되살려 캐시에 남기는 경우까지 막는다.
-async function refreshAll({ updateThread = true } = {}) {
-  invalidateRotation();
-  await loadSheets();
-  await loadPersisted();
-  invalidateRotation();
-  if (updateThread) await updateWeeklyThread();
+async function refreshAll(team, { updateThread = true } = {}) {
+  invalidateRotation(team);
+  await loadSheets(team);
+  await loadPersisted(team);
+  invalidateRotation(team);
+  if (updateThread) await updateWeeklyThread(team);
 }
 
 // ─── 앱 ───────────────────────────────────────────────
@@ -404,15 +482,13 @@ app.error(async (error) => {
   console.error('[Bolt] 처리되지 않은 에러:', error);
 });
 
+// 알림 채널은 팀마다 다르다 (TEAMS[].channel)
 const CONFIG = {
-  notifyChannel: process.env.SLACK_CHANNEL,
   notifyTime: '30 7 * * *',
   weeklyTime: '0 7 * * 1',
   eveningNotifyTime: '0 18 * * *',
 };
 
-const overrides = {};
-const leaves = {}; // { '이름': Set<'YYYY-MM-DD'> }
 let botUserId = null;
 
 // ─── 날짜 유틸 ────────────────────────────────────────
@@ -478,26 +554,30 @@ async function getRealName(client, userId) {
 }
 
 // ─── 연차 유틸 ────────────────────────────────────────
-function isOnLeave(name, dateStr) {
+function isOnLeave(team, name, dateStr) {
+  const { leaves } = team;
   return !!(name && leaves[name] && leaves[name].has(dateStr));
 }
 
-function addLeave(name, dates) {
+function addLeave(team, name, dates) {
+  const { leaves } = team;
   if (!leaves[name]) leaves[name] = new Set();
   for (const d of dates) leaves[name].add(d);
-  invalidateRotation();
+  invalidateRotation(team);
 }
 
-function removeLeave(name, dates) {
+function removeLeave(team, name, dates) {
+  const { leaves } = team;
   if (!leaves[name]) return 0;
   let count = 0;
   for (const d of dates) { if (leaves[name].delete(d)) count++; }
   if (leaves[name].size === 0) delete leaves[name];
-  if (count) invalidateRotation();
+  if (count) invalidateRotation(team);
   return count;
 }
 
-function leaveListText() {
+function leaveListText(team) {
+  const { leaves } = team;
   const names = Object.keys(leaves).filter(n => leaves[n].size > 0);
   if (!names.length) return 'ℹ️ 등록된 연차가 없어요.';
   const lines = names.map(name => {
@@ -513,7 +593,8 @@ function leaveListText() {
 // 캐시갱신 응답에는 아직 유효한 건수만 보여준다 (오늘 포함, Asia/Seoul 기준).
 
 // 날짜가 오늘 이후인 변경 건수 — 같은 날의 메인/크첵은 1건으로 센다
-function upcomingOverrideCount() {
+function upcomingOverrideCount(team) {
+  const { overrides } = team;
   const today = todayStr();
   const dates = new Set();
   for (const key of Object.keys(overrides)) {
@@ -524,7 +605,8 @@ function upcomingOverrideCount() {
 }
 
 // 종료일이 오늘 이후인 연차 인원 수 (연차는 날짜 Set이라 마지막 날짜가 종료일)
-function upcomingLeaveCount() {
+function upcomingLeaveCount(team) {
+  const { leaves } = team;
   const today = todayStr();
   return Object.keys(leaves).filter(name => {
     for (const d of leaves[name]) { if (d >= today) return true; }
@@ -534,15 +616,15 @@ function upcomingLeaveCount() {
 
 // ─── 당번 계산 ────────────────────────────────────────
 // 반환: { name: string|null, isSubstitute: boolean }
-function dayDiff(dateStr) {
-  const start = new Date(sheetCache.startDate);
+function dayDiff(team, dateStr) {
+  const start = new Date(team.sheetCache.startDate);
   const target = new Date(dateStr);
   return Math.round((target - start) / (1000 * 60 * 60 * 24));
 }
 
 // 루프 시작일 기준 n일째 날짜 문자열 (dayDiff의 역함수)
-function dateAtDiff(n) {
-  const d = new Date(sheetCache.startDate);
+function dateAtDiff(team, n) {
+  const d = new Date(team.sheetCache.startDate);
   d.setUTCDate(d.getUTCDate() + n);
   return d.toISOString().slice(0, 10);
 }
@@ -551,31 +633,29 @@ function dateAtDiff(n) {
 // 연차자는 차례를 "소비하지 않고" 건너뛴다. 건너뛴 칸만큼 커서가 함께 진행하므로
 // 연차 기간에는 남은 인원만으로 순환한다.
 //   예) 루프 [A,B,C,D,E]에서 C가 연차면 → A → B → D → E → A → B → D …
-// 커서는 날짜순 누적 상태이므로 하루씩 시뮬레이션해서 캐시에 쌓는다.
+// 커서는 날짜순 누적 상태이므로 하루씩 시뮬레이션해서 팀별 캐시에 쌓는다.
 // (연차가 등록되기 전 구간은 커서 = 달력 인덱스라서 시뮬레이션 없이 바로 계산)
-let rotationVersion = 0;
-let rotationCache = null;
-
-function invalidateRotation() {
-  rotationVersion++;
-  rotationCache = null;
+function invalidateRotation(team) {
+  team.rotationVersion++;
+  team.rotationCache = null;
 }
 
 const EMPTY_ROTATION = { main: null, mainSub: false, check: null, checkSub: false };
 
 // 등록된 연차 중 가장 이른 날의 diff (연차 없으면 null)
-function earliestLeaveDiff() {
+function earliestLeaveDiff(team) {
+  const { leaves } = team;
   let min = null;
   for (const name of Object.keys(leaves)) {
     for (const d of leaves[name]) { if (min === null || d < min) min = d; }
   }
   if (min === null) return null;
-  return Math.max(0, dayDiff(min));
+  return Math.max(0, dayDiff(team, min));
 }
 
 // 연차 영향이 없는 구간의 커서 = 달력 인덱스
-function baseCursors(diff) {
-  const { loop, checkLoop } = sheetCache;
+function baseCursors(team, diff) {
+  const { loop, checkLoop } = team.sheetCache;
   const perCycle = loop.filter(r => r.needCheck).length;
   const cycles = Math.floor(diff / loop.length);
   const rest = loop.slice(0, diff % loop.length).filter(r => r.needCheck).length;
@@ -585,35 +665,36 @@ function baseCursors(diff) {
   };
 }
 
-function plainRotation(diff) {
-  const { loop, checkLoop } = sheetCache;
+function plainRotation(team, diff) {
+  const { loop, checkLoop } = team.sheetCache;
   const idx = diff % loop.length;
   const check = (loop[idx].needCheck && checkLoop.length)
-    ? (checkLoop[baseCursors(diff).check].check || null)
+    ? (checkLoop[baseCursors(team, diff).check].check || null)
     : null;
   return { main: loop[idx].main || null, mainSub: false, check, checkSub: false };
 }
 
 // 커서를 하루 진행시키고 그날의 배정을 반환
-function stepRotation(n) {
-  const { loop, checkLoop } = sheetCache;
+function stepRotation(team, n) {
+  const { loop, checkLoop } = team.sheetCache;
+  const cache = team.rotationCache;
   const L = loop.length;
   const CL = checkLoop.length;
-  const ds = dateAtDiff(n);
+  const ds = dateAtDiff(team, n);
 
   // 메인 — 커서부터 연차가 아닌 첫 사람
   let idx = -1;
   let skip = 0;
   for (; skip < L; skip++) {
-    const cand = loop[(rotationCache.mainCursor + skip) % L].main;
-    if (cand && !isOnLeave(cand, ds)) { idx = (rotationCache.mainCursor + skip) % L; break; }
+    const cand = loop[(cache.mainCursor + skip) % L].main;
+    if (cand && !isOnLeave(team, cand, ds)) { idx = (cache.mainCursor + skip) % L; break; }
   }
   if (idx < 0) { // 전원 연차
-    rotationCache.mainCursor = (rotationCache.mainCursor + 1) % L;
+    cache.mainCursor = (cache.mainCursor + 1) % L;
     return { ...EMPTY_ROTATION };
   }
   const main = loop[idx].main;
-  rotationCache.mainCursor = (idx + 1) % L; // 건너뛴 칸까지 함께 소비
+  cache.mainCursor = (idx + 1) % L; // 건너뛴 칸까지 함께 소비
 
   // 크첵 — 그날 메인의 '크첵필요' 여부로 판단, 크첵루프에서 연차자 건너뜀
   let check = null;
@@ -622,111 +703,114 @@ function stepRotation(n) {
     let cIdx = -1;
     let cSkip = 0;
     for (; cSkip < CL; cSkip++) {
-      const cand = checkLoop[(rotationCache.checkCursor + cSkip) % CL].check;
-      if (cand && !isOnLeave(cand, ds)) { cIdx = (rotationCache.checkCursor + cSkip) % CL; break; }
+      const cand = checkLoop[(cache.checkCursor + cSkip) % CL].check;
+      if (cand && !isOnLeave(team, cand, ds)) { cIdx = (cache.checkCursor + cSkip) % CL; break; }
     }
     if (cIdx >= 0) {
       check = checkLoop[cIdx].check;
       checkSub = cSkip > 0;
-      rotationCache.checkCursor = (cIdx + 1) % CL; // 크첵 배정된 날만 진행
+      cache.checkCursor = (cIdx + 1) % CL; // 크첵 배정된 날만 진행
     }
   }
   return { main, mainSub: skip > 0, check, checkSub };
 }
 
-function simulatedRotation(targetDiff) {
-  if (!rotationCache || rotationCache.version !== rotationVersion) {
-    const anchor = earliestLeaveDiff() || 0;
-    const base = baseCursors(anchor);
-    rotationCache = {
-      version: rotationVersion, next: anchor,
+function simulatedRotation(team, targetDiff) {
+  if (!team.rotationCache || team.rotationCache.version !== team.rotationVersion) {
+    const anchor = earliestLeaveDiff(team) || 0;
+    const base = baseCursors(team, anchor);
+    team.rotationCache = {
+      version: team.rotationVersion, next: anchor,
       mainCursor: base.main, checkCursor: base.check,
       map: new Map(),
     };
   }
-  for (let n = rotationCache.next; n <= targetDiff; n++) {
-    rotationCache.map.set(n, stepRotation(n));
-    rotationCache.next = n + 1;
+  const cache = team.rotationCache;
+  for (let n = cache.next; n <= targetDiff; n++) {
+    cache.map.set(n, stepRotation(team, n));
+    cache.next = n + 1;
   }
-  return rotationCache.map.get(targetDiff) || { ...EMPTY_ROTATION };
+  return cache.map.get(targetDiff) || { ...EMPTY_ROTATION };
 }
 
-function rotationFor(dateStr) {
-  const { loop, startDate } = sheetCache;
+function rotationFor(team, dateStr) {
+  const { loop, startDate } = team.sheetCache;
   if (!startDate || !loop.length) return EMPTY_ROTATION;
-  const diff = dayDiff(dateStr);
+  const diff = dayDiff(team, dateStr);
   if (diff < 0) return EMPTY_ROTATION;
 
-  const anchor = earliestLeaveDiff();
+  const anchor = earliestLeaveDiff(team);
   // 연차가 없거나 첫 연차보다 이전 날짜면 달력 인덱스 그대로
-  if (anchor === null || diff < anchor) return plainRotation(diff);
-  return simulatedRotation(diff);
+  if (anchor === null || diff < anchor) return plainRotation(team, diff);
+  return simulatedRotation(team, diff);
 }
 
-function getMain(dateStr) {
+function getMain(team, dateStr) {
+  const { overrides } = team;
   if (`${dateStr}:main` in overrides) {
     return { name: overrides[`${dateStr}:main`] || null, isSubstitute: false };
   }
-  const r = rotationFor(dateStr);
+  const r = rotationFor(team, dateStr);
   return { name: r.main, isSubstitute: r.mainSub };
 }
 
-function getCheck(dateStr) {
+function getCheck(team, dateStr) {
+  const { overrides } = team;
   if (`${dateStr}:check` in overrides) {
     return { name: overrides[`${dateStr}:check`] || null, isSubstitute: false };
   }
-  const r = rotationFor(dateStr);
+  const r = rotationFor(team, dateStr);
   return { name: r.check, isSubstitute: r.checkSub };
 }
 
-function mentionTag(name) {
-  const id = sheetCache.members[name];
+function mentionTag(team, name) {
+  const id = team.sheetCache.members[name];
   return id ? `<@${id}>` : `*${name}*`;
 }
 
-// 슬랙 유저 ID → 멤버 시트 이름 (없으면 null)
-function memberNameById(userId) {
-  for (const [name, id] of Object.entries(sheetCache.members)) {
+// 슬랙 유저 ID → 팀 멤버 시트 이름 (없으면 null)
+function memberNameById(team, userId) {
+  for (const [name, id] of Object.entries(team.sheetCache.members)) {
     if (id && id === userId) return name;
   }
   return null;
 }
 
 // 해당 날짜에 name의 역할 판별: 'main' | 'check' | null (메인 우선)
-function requesterRole(dateStr, name) {
+function requesterRole(team, dateStr, name) {
   if (!name) return null;
-  if (name === getMain(dateStr).name) return 'main';
-  if (name === getCheck(dateStr).name) return 'check';
+  if (name === getMain(team, dateStr).name) return 'main';
+  if (name === getCheck(team, dateStr).name) return 'check';
   return null;
 }
 
 // ─── 메시지 포맷 ──────────────────────────────────────
-function formatDutyLine(mainName, checkName, withTag) {
-  const mainText = withTag ? mentionTag(mainName) : `*${mainName}*`;
+function formatDutyLine(team, mainName, checkName, withTag) {
+  const mainText = withTag ? mentionTag(team, mainName) : `*${mainName}*`;
   if (checkName && checkName !== 'NONE') {
-    const checkText = withTag ? mentionTag(checkName) : `*${checkName}*`;
+    const checkText = withTag ? mentionTag(team, checkName) : `*${checkName}*`;
     return `${mainText} (${checkText})`;
   }
   return mainText;
 }
 
-function dutyMessage(dateStr, withTag = false) {
+function dutyMessage(team, dateStr, withTag = false) {
   const label = dateLabel(dateStr);
-  const { name: main } = getMain(dateStr);
-  const { name: check } = getCheck(dateStr);
-  const line = main ? formatDutyLine(main, check, withTag) : '—';
+  const { name: main } = getMain(team, dateStr);
+  const { name: check } = getCheck(team, dateStr);
+  const line = main ? formatDutyLine(team, main, check, withTag) : '—';
   return `🔔 *[당번 알림]* ${label}\n\n오늘 당번은 ${line} 님입니다! 수고해주세요 💪`;
 }
 
-function eveningMessage(tomorrowStr, withTag = false) {
+function eveningMessage(team, tomorrowStr, withTag = false) {
   const label = dateLabel(tomorrowStr);
-  const { name: main } = getMain(tomorrowStr);
-  const { name: check } = getCheck(tomorrowStr);
-  const line = main ? formatDutyLine(main, check, withTag) : '—';
+  const { name: main } = getMain(team, tomorrowStr);
+  const { name: check } = getCheck(team, tomorrowStr);
+  const line = main ? formatDutyLine(team, main, check, withTag) : '—';
   return `🌙 *[내일 당번 예고]* ${label}\n\n내일 당번은 ${line} 님입니다!`;
 }
 
-function weeklyMessage(fromDateStr) {
+function weeklyMessage(team, fromDateStr) {
   const dayNames = ['일', '월', '화', '수', '목', '금', '토'];
   const lines = [];
   for (let i = 0; i < 7; i++) {
@@ -735,8 +819,8 @@ function weeklyMessage(fromDateStr) {
     const ds = d.toLocaleDateString('sv-SE');
     const [, mm, dd] = ds.split('-');
     const day = dayNames[d.getDay()];
-    const { name: main } = getMain(ds);
-    const { name: check } = getCheck(ds);
+    const { name: main } = getMain(team, ds);
+    const { name: check } = getCheck(team, ds);
     const mainStr = main || '—';
     const dutyLine = (check && check !== 'NONE') ? `${mainStr} (${check})` : mainStr;
     lines.push(`• ${mm}.${dd} (${day})  ${dutyLine}`);
@@ -766,13 +850,13 @@ function getMonthWeeks(dateStr) {
   }));
 }
 
-function formatWeekDates(dates) {
+function formatWeekDates(team, dates) {
   const dayNames = ['일', '월', '화', '수', '목', '금', '토'];
   return dates.map(ds => {
     const [, mm, dd] = ds.split('-');
     const day = dayNames[new Date(ds).getDay()];
-    const { name: main } = getMain(ds);
-    const { name: check } = getCheck(ds);
+    const { name: main } = getMain(team, ds);
+    const { name: check } = getCheck(team, ds);
     const mainStr = main || '—';
     const dutyLine = (check && check !== 'NONE') ? `${mainStr} (${check})` : mainStr;
     return `• ${mm}.${dd} (${day})  ${dutyLine}`;
@@ -780,9 +864,9 @@ function formatWeekDates(dates) {
 }
 
 // ─── 주간 스레드 ──────────────────────────────────────
-async function updateWeeklyThread() {
+async function updateWeeklyThread(team) {
   try {
-    const ts = await getThreadTs();
+    const ts = await getThreadTs(team);
     if (!ts) return;
     const threadDate = new Date(parseFloat(ts) * 1000);
     const threadDateStr = threadDate.toLocaleDateString('sv-SE', { timeZone: 'Asia/Seoul' });
@@ -793,35 +877,37 @@ async function updateWeeklyThread() {
     const mondayStr = monday.toLocaleDateString('sv-SE');
     const weekLabel = getWeekLabel(mondayStr);
     await app.client.chat.update({
-      channel: CONFIG.notifyChannel,
+      channel: team.channel,
       ts,
-      text: `📅 *${weekLabel} 당번 일정*\n\n${weeklyMessage(mondayStr)}`,
+      text: `📅 *${weekLabel} 당번 일정*\n\n${weeklyMessage(team, mondayStr)}`,
     });
   } catch (e) {
-    console.error('주간 스레드 업데이트 실패:', e.message);
+    console.error(`[${team.label}] 주간 스레드 업데이트 실패:`, e.message);
   }
 }
 
-async function ensureWeeklyThread() {
-  const ts = await getThreadTs();
+async function ensureWeeklyThread(team) {
+  const ts = await getThreadTs(team);
   if (ts) return ts;
+  // 운영 전 팀은 주간 스레드를 만들지 않는다 (빈 일정 스레드가 채널에 남지 않도록)
+  if (!isOperating(team)) throw new Error(`${team.label} 운영 전이라 주간 스레드를 만들지 않아요.`);
   const today = todayStr();
   const weekLabel = getWeekLabel(today);
   const res = await app.client.chat.postMessage({
-    channel: CONFIG.notifyChannel,
-    text: `📅 *${weekLabel} 당번 일정*\n\n${weeklyMessage(today)}`,
+    channel: team.channel,
+    text: `📅 *${weekLabel} 당번 일정*\n\n${weeklyMessage(team, today)}`,
   });
-  await setThreadTs(res.ts);
+  await setThreadTs(team, res.ts);
   return res.ts;
 }
 
-// 주간 스레드에 답글로 게시한다. 스레드가 없으면 ensureWeeklyThread() 로 먼저 확보.
-async function postWeeklyReply({ text, blocks }) {
-  const weeklyTs = await ensureWeeklyThread();
-  const payload = { channel: CONFIG.notifyChannel, thread_ts: weeklyTs, text };
+// 팀 주간 스레드에 답글로 게시한다. 스레드가 없으면 ensureWeeklyThread() 로 먼저 확보.
+async function postWeeklyReply(team, { text, blocks }) {
+  const weeklyTs = await ensureWeeklyThread(team);
+  const payload = { channel: team.channel, thread_ts: weeklyTs, text };
   if (blocks) payload.blocks = blocks;
   const res = await app.client.chat.postMessage(payload);
-  console.log(`[주간스레드] 답글 게시 thread_ts=${weeklyTs} ts=${res.ts}`);
+  console.log(`[주간스레드][${team.label}] 답글 게시 thread_ts=${weeklyTs} ts=${res.ts}`);
   return { weeklyTs, ts: res.ts };
 }
 
@@ -832,6 +918,7 @@ const MANUAL_TEXT = `📖 *당번봇 매뉴얼*
 매일 아침 당번을 자동으로 알려주는 봇이에요.
 당번 순서는 구글 시트에서 관리하고, 봇은 시트를 읽어서 알림을 보내요.
 순서 변경이나 팀원 추가는 시트에서 직접 수정하면 돼요.
+👥 팀(파인트팀/스틱바팀)은 명령어를 입력한 채널로 자동 구분돼요. 명령어는 똑같이 쓰면 돼요.
 
 📅 *자동 알림*
 • 매주 월요일 07:00 — 이번 주 당번 스레드 생성
@@ -900,22 +987,31 @@ async function replaceSourceMessage({ body, client, respond, text }) {
   }
 }
 
+// 버튼/모달이 눌린 채널로 팀을 찾는다. 등록되지 않은 채널이면 로그만 남기고 null.
+function teamForAction(channelId, actionName) {
+  const team = teamByChannel(channelId);
+  if (!team) console.warn(`[${actionName}] 등록되지 않은 채널 ch=${channelId} — 무시`);
+  return team;
+}
+
 // ─── 요청 방식: 대리 요청 (주간 스레드 공지) ──────────
 app.action('req_delegate', async ({ body, ack, client, respond }) => {
   await ack();
+  const team = teamForAction(body.channel?.id, 'req_delegate');
+  if (!team) return;
   const { date, role } = JSON.parse(body.actions[0].value);
-  const requesterName = memberNameById(body.user.id) || await getRealName(app.client, body.user.id);
+  const requesterName = memberNameById(team, body.user.id) || await getRealName(app.client, body.user.id);
   const roleLabel = role === 'check' ? '크첵' : '메인';
 
-  // 태그 대상: 메인 → 멤버 전체, 크첵 → 크첵루프 인원 (본인 제외)
+  // 태그 대상: 메인 → 팀 멤버 전체, 크첵 → 팀 크첵루프 인원 (본인 제외)
   const pool = role === 'check'
-    ? sheetCache.checkLoop.map(r => r.check)
-    : Object.keys(sheetCache.members);
+    ? team.sheetCache.checkLoop.map(r => r.check)
+    : Object.keys(team.sheetCache.members);
   const tagNames = [...new Set(pool)].filter(n => n && n !== 'NONE' && n !== requesterName);
-  const tagText = tagNames.map(n => mentionTag(n)).join(' ');
+  const tagText = tagNames.map(n => mentionTag(team, n)).join(' ');
 
   const actionValue = JSON.stringify({ date, requester: requesterName, role });
-  await postWeeklyReply({
+  await postWeeklyReply(team, {
     text: `🙏 ${dateLabel(date)} ${roleLabel} 당번 교체 요청`,
     blocks: [
       { type: 'section', text: { type: 'mrkdwn', text: `${tagText}\n${requesterName} 님이 ${dateLabel(date)} ${roleLabel} 당번을 대신 해주실 분을 찾고 있어요. 😢🙏` } },
@@ -931,12 +1027,15 @@ app.action('req_delegate', async ({ body, ack, client, respond }) => {
 // ─── 요청 방식: 날짜 교체 (모달로 날짜 입력) ──────────
 app.action('req_swap', async ({ body, ack, client, respond }) => {
   await ack();
+  const team = teamForAction(body.channel?.id, 'req_swap');
+  if (!team) return;
   const { date, role } = JSON.parse(body.actions[0].value);
   const roleLabel = role === 'check' ? '크첵' : '메인';
   await client.views.open({
     trigger_id: body.trigger_id,
     view: {
       type: 'modal', callback_id: 'swap_modal',
+      // 모달 제출에는 채널 정보가 없으므로 팀 판별용으로 채널을 실어 보낸다
       private_metadata: JSON.stringify({ date, role, channel: body.channel.id }),
       title: { type: 'plain_text', text: '날짜 교체 요청' },
       submit: { type: 'plain_text', text: '요청' },
@@ -952,29 +1051,33 @@ app.action('req_swap', async ({ body, ack, client, respond }) => {
   await replaceSourceMessage({ body, client, respond, text: '🔄 날짜 교체 요청 창을 열었어요. (창에서 날짜를 입력하세요)' });
 });
 
-// 날짜 교체 모달 제출 → 상대 당번에게 태그해 채널 공지
-app.view('swap_modal', async ({ body, ack, view, client }) => {
-  // channel 은 더 이상 쓰지 않는다 — 공지는 항상 주간 스레드로 간다
-  const { date, role } = JSON.parse(view.private_metadata);
+// 날짜 교체 모달 제출 → 같은 팀의 상대 당번에게 태그해 팀 주간 스레드에 공지
+app.view('swap_modal', async ({ body, ack, view }) => {
+  const { date, role, channel } = JSON.parse(view.private_metadata);
+  const team = teamForAction(channel, 'swap_modal');
+  if (!team) {
+    await ack({ response_action: 'errors', errors: { swap_date: UNREGISTERED_CHANNEL_TEXT } });
+    return;
+  }
   const raw = (view.state.values['swap_date']?.['picked']?.value || '').trim();
   const date2 = parseDate(raw);
   if (!date2) { await ack({ response_action: 'errors', errors: { swap_date: '날짜 형식은 MM.DD 예요 (예: 07.21)' } }); return; }
   if (date2 === date) { await ack({ response_action: 'errors', errors: { swap_date: '같은 날짜로는 교체할 수 없어요.' } }); return; }
 
   const roleLabel = role === 'check' ? '크첵' : '메인';
-  const counterpart = role === 'check' ? getCheck(date2).name : getMain(date2).name;
+  const counterpart = role === 'check' ? getCheck(team, date2).name : getMain(team, date2).name;
   if (!counterpart || counterpart === 'NONE') {
     await ack({ response_action: 'errors', errors: { swap_date: `그 날짜에 ${roleLabel} 당번이 없어요.` } });
     return;
   }
   await ack();
 
-  const requesterName = memberNameById(body.user.id) || await getRealName(app.client, body.user.id);
+  const requesterName = memberNameById(team, body.user.id) || await getRealName(app.client, body.user.id);
   const actionValue = JSON.stringify({ date, date2, role, requester: requesterName, counterpart });
-  await postWeeklyReply({
+  await postWeeklyReply(team, {
     text: `🔄 ${dateLabel(date)} ↔ ${dateLabel(date2)} 날짜 교체 요청`,
     blocks: [
-      { type: 'section', text: { type: 'mrkdwn', text: `${mentionTag(counterpart)}\n${requesterName} 님이 날짜 교체를 요청해요. 😢🙏\n${dateLabel(date)} ${requesterName} ↔ ${dateLabel(date2)} ${counterpart}` } },
+      { type: 'section', text: { type: 'mrkdwn', text: `${mentionTag(team, counterpart)}\n${requesterName} 님이 날짜 교체를 요청해요. 😢🙏\n${dateLabel(date)} ${requesterName} ↔ ${dateLabel(date2)} ${counterpart}` } },
       { type: 'actions', elements: [
         { type: 'button', text: { type: 'plain_text', text: '✅ 수락' }, style: 'primary', action_id: 'swap_accept', value: actionValue },
         { type: 'button', text: { type: 'plain_text', text: '❌ 거절' }, style: 'danger', action_id: 'swap_decline', value: actionValue },
@@ -986,50 +1089,58 @@ app.view('swap_modal', async ({ body, ack, view, client }) => {
 // ─── 대리 요청 수락/거절 ──────────────────────────────
 app.action('delegate_accept', async ({ body, ack, client }) => {
   await ack();
+  const team = teamForAction(body.channel?.id, 'delegate_accept');
+  if (!team) return;
   const { date, requester, role } = JSON.parse(body.actions[0].value);
-  const acceptor = memberNameById(body.user.id) || await getRealName(app.client, body.user.id);
+  const acceptor = memberNameById(team, body.user.id) || await getRealName(app.client, body.user.id);
   const roleLabel = role === 'check' ? '크첵' : '메인';
-  overrides[`${date}:${role === 'check' ? 'check' : 'main'}`] = acceptor;
-  await syncOverrideRow(date);
+  team.overrides[`${date}:${role === 'check' ? 'check' : 'main'}`] = acceptor;
+  await syncOverrideRow(team, date);
   await client.chat.update({
     channel: body.channel.id, ts: body.message.ts, text: `✅ 당번 교체 완료`,
     blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `✅ *${dateLabel(date)}* ${roleLabel} 당번이 ${acceptor} 님으로 변경됐어요. ${requester} → ${acceptor}` } }],
   });
-  await updateWeeklyThread();
-  console.log(`[대리요청] 수락 date=${date} role=${role} ${requester} → ${acceptor}`);
+  await updateWeeklyThread(team);
+  console.log(`[대리요청][${team.label}] 수락 date=${date} role=${role} ${requester} → ${acceptor}`);
 });
 
 app.action('delegate_decline', async ({ body, ack }) => {
   await ack();
-  const decliner = memberNameById(body.user.id) || await getRealName(app.client, body.user.id);
+  const team = teamForAction(body.channel?.id, 'delegate_decline');
+  if (!team) return;
+  const decliner = memberNameById(team, body.user.id) || await getRealName(app.client, body.user.id);
   // 요청 메시지가 이미 주간 스레드 안에 있으므로 그 ts 를 thread_ts 로 쓰면
   // 스레드 중첩이 된다 — 주간 스레드에 직접 답글로 단다
-  await postWeeklyReply({ text: randomDecline(decliner) });
-  console.log(`[대리요청] 거절 user=${body.user.id} name=${decliner}`);
+  await postWeeklyReply(team, { text: randomDecline(decliner) });
+  console.log(`[대리요청][${team.label}] 거절 user=${body.user.id} name=${decliner}`);
 });
 
 // ─── 날짜 교체 수락/거절 ──────────────────────────────
 app.action('swap_accept', async ({ body, ack, client }) => {
   await ack();
+  const team = teamForAction(body.channel?.id, 'swap_accept');
+  if (!team) return;
   const { date, date2, role, requester, counterpart } = JSON.parse(body.actions[0].value);
   const roleKey = role === 'check' ? 'check' : 'main';
-  overrides[`${date}:${roleKey}`] = counterpart;
-  overrides[`${date2}:${roleKey}`] = requester;
-  await syncOverrideRow(date);
-  await syncOverrideRow(date2);
+  team.overrides[`${date}:${roleKey}`] = counterpart;
+  team.overrides[`${date2}:${roleKey}`] = requester;
+  await syncOverrideRow(team, date);
+  await syncOverrideRow(team, date2);
   await client.chat.update({
     channel: body.channel.id, ts: body.message.ts, text: `✅ 날짜 교체 완료`,
     blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `✅ *${dateLabel(date)}* ↔ *${dateLabel(date2)}* 교체 완료! ${requester} ↔ ${counterpart}` } }],
   });
-  await updateWeeklyThread();
-  console.log(`[날짜교체] 수락 ${date} ↔ ${date2} role=${role} ${requester} ↔ ${counterpart}`);
+  await updateWeeklyThread(team);
+  console.log(`[날짜교체][${team.label}] 수락 ${date} ↔ ${date2} role=${role} ${requester} ↔ ${counterpart}`);
 });
 
 app.action('swap_decline', async ({ body, ack }) => {
   await ack();
-  const decliner = memberNameById(body.user.id) || await getRealName(app.client, body.user.id);
-  await postWeeklyReply({ text: randomDecline(decliner) });
-  console.log(`[날짜교체] 거절 user=${body.user.id} name=${decliner}`);
+  const team = teamForAction(body.channel?.id, 'swap_decline');
+  if (!team) return;
+  const decliner = memberNameById(team, body.user.id) || await getRealName(app.client, body.user.id);
+  await postWeeklyReply(team, { text: randomDecline(decliner) });
+  console.log(`[날짜교체][${team.label}] 거절 user=${body.user.id} name=${decliner}`);
 });
 
 // ─── 이번달 주차 선택 버튼 ────────────────────────────
@@ -1066,6 +1177,8 @@ async function markMonthSelectDone(client, body, monthNum) {
 
 app.action('month_confirm', async ({ body, ack, client }) => {
   await ack();
+  const team = teamForAction(body.channel?.id, 'month_confirm');
+  if (!team) return;
   const anchor = body.actions[0].value;
   const threadTs = body.message.thread_ts || body.message.ts;
   const monthNum = new Date(anchor).getMonth() + 1;
@@ -1077,58 +1190,81 @@ app.action('month_confirm', async ({ body, ack, client }) => {
   await markMonthSelectDone(client, body, monthNum);
   const selectedNums = selected.map(o => Number(o.value));
   const chosen = getMonthWeeks(anchor).filter(w => selectedNums.includes(w.week));
-  const sections = chosen.map(w => `📅 *${w.label}*\n${formatWeekDates(w.dates)}`).join('\n\n');
+  const sections = chosen.map(w => `📅 *${w.label}*\n${formatWeekDates(team, w.dates)}`).join('\n\n');
   await client.chat.postMessage({ channel: body.channel.id, thread_ts: threadTs, text: sections });
 });
 
 app.action('month_all', async ({ body, ack, client }) => {
   await ack();
+  const team = teamForAction(body.channel?.id, 'month_all');
+  if (!team) return;
   const anchor = body.actions[0].value;
   const threadTs = body.message.thread_ts || body.message.ts;
   const monthNum = new Date(anchor).getMonth() + 1;
   await markMonthSelectDone(client, body, monthNum);
-  const sections = getMonthWeeks(anchor).map(w => `📅 *${w.label}*\n${formatWeekDates(w.dates)}`).join('\n\n');
+  const sections = getMonthWeeks(anchor).map(w => `📅 *${w.label}*\n${formatWeekDates(team, w.dates)}`).join('\n\n');
   await client.chat.postMessage({ channel: body.channel.id, thread_ts: threadTs, text: `📅 *${monthNum}월 전체 당번 일정*\n\n${sections}` });
 });
 
+// ─── 자동 알림 공통 ───────────────────────────────────
+// 팀마다 따로 보낸다. 운영 전(루프 비었거나 시작일 전) 팀은 아무것도 보내지 않고,
+// 한 팀이 실패해도 다른 팀 알림은 나간다.
+async function forEachOperatingTeam(jobName, fn) {
+  for (const team of TEAMS) {
+    if (!team.channel) {
+      console.warn(`[${jobName}][${team.label}] 채널 미설정 — 건너뜀`);
+      continue;
+    }
+    if (!isOperating(team)) {
+      console.log(`[${jobName}][${team.label}] 운영 전 — 건너뜀 (루프 ${team.sheetCache.loop.length}칸, 시작일 ${team.sheetCache.startDate || '없음'})`);
+      continue;
+    }
+    try {
+      await fn(team);
+    } catch (e) {
+      console.error(`[${jobName}][${team.label}] 실패:`, e.data?.error || e.message);
+    }
+  }
+}
+
 // ─── 매주 월요일 07:00 — 새 주간 스레드 생성 ──────────
-cron.schedule(CONFIG.weeklyTime, async () => {
+cron.schedule(CONFIG.weeklyTime, () => forEachOperatingTeam('주간스레드', async (team) => {
   const today = todayStr();
   const weekLabel = getWeekLabel(today);
   const res = await app.client.chat.postMessage({
-    channel: CONFIG.notifyChannel,
-    text: `📅 *${weekLabel} 당번 일정*\n\n${weeklyMessage(today)}`,
+    channel: team.channel,
+    text: `📅 *${weekLabel} 당번 일정*\n\n${weeklyMessage(team, today)}`,
   });
   try {
-    await setThreadTs(res.ts);
+    await setThreadTs(team, res.ts);
   } catch (e) {
-    console.error('Railway 환경변수 업데이트 실패:', e.message);
+    console.error(`[${team.label}] Railway 환경변수 업데이트 실패:`, e.message);
   }
-}, { timezone: 'Asia/Seoul' });
+}), { timezone: 'Asia/Seoul' });
 
 // ─── 매일 07:30 — 오늘 당번 알림 + 태그 ──────────────
-cron.schedule(CONFIG.notifyTime, async () => {
+cron.schedule(CONFIG.notifyTime, () => forEachOperatingTeam('오늘알림', async (team) => {
   const today = todayStr();
-  const ts = await ensureWeeklyThread();
+  const ts = await ensureWeeklyThread(team);
   await app.client.chat.postMessage({
-    channel: CONFIG.notifyChannel,
+    channel: team.channel,
     thread_ts: ts,
-    text: dutyMessage(today, true),
+    text: dutyMessage(team, today, true),
   });
-}, { timezone: 'Asia/Seoul' });
+}), { timezone: 'Asia/Seoul' });
 
 // ─── 매일 18:00 — 내일 당번 예고 + 태그 ──────────────
-cron.schedule(CONFIG.eveningNotifyTime, async () => {
+cron.schedule(CONFIG.eveningNotifyTime, () => forEachOperatingTeam('내일예고', async (team) => {
   const tomorrow = new Date();
   tomorrow.setDate(tomorrow.getDate() + 1);
   const tomorrowStr = tomorrow.toLocaleDateString('sv-SE', { timeZone: 'Asia/Seoul' });
-  const ts = await ensureWeeklyThread();
+  const ts = await ensureWeeklyThread(team);
   await app.client.chat.postMessage({
-    channel: CONFIG.notifyChannel,
+    channel: team.channel,
     thread_ts: ts,
-    text: eveningMessage(tomorrowStr, true),
+    text: eveningMessage(team, tomorrowStr, true),
   });
-}, { timezone: 'Asia/Seoul' });
+}), { timezone: 'Asia/Seoul' });
 
 // ─── @당번봇 멘션 처리 ────────────────────────────────
 // 어떤 경로로 빠져나가든 사용자에게 응답이 가도록 래퍼로 감싼다
@@ -1178,11 +1314,19 @@ async function handleMention({ event, client, say }) {
 
   const reply = async (msg) => { await say({ text: msg, thread_ts: threadTs }); };
 
-  // 결과는 주간 스레드에 답글로 남긴다. 명령을 다른 곳에서 쳤다면
+  // 팀은 멘션이 들어온 채널로 정한다
+  const team = teamByChannel(event.channel);
+  if (!team) {
+    console.log(`[멘션] 등록되지 않은 채널 ch=${event.channel}`);
+    await reply(UNREGISTERED_CHANNEL_TEXT); return;
+  }
+  const { overrides } = team;
+
+  // 결과는 팀 주간 스레드에 답글로 남긴다. 명령을 다른 곳에서 쳤다면
   // 무응답으로 보이지 않도록 그 자리에도 위치를 알려준다.
   const replyWeekly = async (msg, blocks) => {
-    const { weeklyTs } = await postWeeklyReply({ text: msg, blocks });
-    if (event.channel !== CONFIG.notifyChannel || threadTs !== weeklyTs) {
+    const { weeklyTs } = await postWeeklyReply(team, { text: msg, blocks });
+    if (threadTs !== weeklyTs) {
       await replyEphemeral({
         client, say, event, threadTs,
         text: '✅ 처리했어요. 결과는 *주간 당번 일정* 스레드에 답글로 올렸어요.',
@@ -1195,18 +1339,27 @@ async function handleMention({ event, client, say }) {
     await reply(MANUAL_TEXT); return;
   }
 
-  // 캐시갱신
+  // 캐시갱신 — 명령이 들어온 채널의 팀만 갱신
   if (cmd === '캐시갱신') {
-    await reply('🔄 시트 캐시 갱신 중...');
-    await refreshAll();
-    await reply(`✅ 캐시 갱신 완료! 멤버 ${Object.keys(sheetCache.members).length}명 / 루프 ${sheetCache.loop.length}칸 / 크첵루프 ${sheetCache.checkLoop.length}칸 / 변경 ${upcomingOverrideCount()}건 / 연차 ${upcomingLeaveCount()}명`);
+    await reply(`🔄 ${team.label} 시트 캐시 갱신 중...`);
+    await refreshAll(team);
+    const { sheetCache } = team;
+    const pending = isOperating(team) ? '' : `\n${notOperatingText(team)}`;
+    await reply(`✅ ${team.label} 캐시 갱신 완료! 멤버 ${Object.keys(sheetCache.members).length}명 / 루프 ${sheetCache.loop.length}칸 / 크첵루프 ${sheetCache.checkLoop.length}칸 / 변경 ${upcomingOverrideCount(team)}건 / 연차 ${upcomingLeaveCount(team)}명${pending}`);
     return;
+  }
+
+  // 여기부터는 당번 데이터가 있어야 하는 명령 — 운영 전이면 안내만 한다
+  // (요청/변경/연차는 주간 스레드에 답글을 다는데, 운영 전엔 스레드를 만들지 않는다)
+  if (!isOperating(team)) {
+    console.log(`[멘션][${team.label}] 운영 전 — cmd="${cmd}" 안내로 응답`);
+    await reply(notOperatingText(team)); return;
   }
 
   // 이번주
   if (cmd === '이번주') {
     const today = todayStr();
-    await reply(`📅 *${getWeekLabel(today)} 당번 일정*\n${weeklyMessage(today)}`); return;
+    await reply(`📅 *${getWeekLabel(today)} 당번 일정*\n${weeklyMessage(team, today)}`); return;
   }
 
   // 다음주
@@ -1214,7 +1367,7 @@ async function handleMention({ event, client, say }) {
     const d = new Date(todayStr());
     d.setDate(d.getDate() + 7);
     const nextWeek = d.toLocaleDateString('sv-SE');
-    await reply(`📅 *${getWeekLabel(nextWeek)} 당번 일정*\n${weeklyMessage(nextWeek)}`); return;
+    await reply(`📅 *${getWeekLabel(nextWeek)} 당번 일정*\n${weeklyMessage(team, nextWeek)}`); return;
   }
 
   // 이번달 — 주차 선택 버튼
@@ -1232,23 +1385,23 @@ async function handleMention({ event, client, say }) {
     const combinedMatch = nameInput.match(/^(.+?)\((.+?)\)$/);
 
     // 변경 전 담당자 (override 반영 전에 계산)
-    const prevMain = getMain(date).name || '—';
-    const prevCheck = getCheck(date).name;
+    const prevMain = getMain(team, date).name || '—';
+    const prevCheck = getCheck(team, date).name;
 
     if (combinedMatch) {
       const [, mainName, checkName] = combinedMatch;
       overrides[`${date}:main`] = mainName;
       overrides[`${date}:check`] = checkName;
-      await syncOverrideRow(date);
-      await updateWeeklyThread();
+      await syncOverrideRow(team, date);
+      await updateWeeklyThread(team);
       const beforeStr = (prevCheck && prevCheck !== 'NONE') ? `${prevMain}(${prevCheck})` : prevMain;
       await replyWeekly(`✅ *${dateLabel(date)}* ${beforeStr} → ${mainName}(${checkName}) 으로 변경했어요.`);
       return;
     }
     overrides[`${date}:main`] = nameInput;
     delete overrides[`${date}:check`];
-    await syncOverrideRow(date);
-    await updateWeeklyThread();
+    await syncOverrideRow(team, date);
+    await updateWeeklyThread(team);
     await replyWeekly(`✅ *${dateLabel(date)}* ${prevMain} → ${nameInput} 으로 변경했어요.`);
     return;
   }
@@ -1261,8 +1414,8 @@ async function handleMention({ event, client, say }) {
     const removed = keys.filter(k => k in overrides);
     removed.forEach(k => delete overrides[k]);
     if (removed.length > 0) {
-      await syncOverrideRow(date);
-      await updateWeeklyThread();
+      await syncOverrideRow(team, date);
+      await updateWeeklyThread(team);
       await replyWeekly(`↩️ *${dateLabel(date)}* 변경을 취소했어요.`);
     } else {
       await reply(`ℹ️ 변경된 내용이 없어요.`);
@@ -1272,7 +1425,7 @@ async function handleMention({ event, client, say }) {
 
   // 요청 MM.DD — 본인 역할(메인/크첵) 자동 구분 후 요청 방식 선택 (나에게만 표시)
   if (cmd === '요청') {
-    console.log(`[요청] 1/4 진입 user=${event.user} args=${JSON.stringify(parts.slice(1))}`);
+    console.log(`[요청][${team.label}] 1/4 진입 user=${event.user} args=${JSON.stringify(parts.slice(1))}`);
 
     const date = parseDate(parts[1] || '');
     if (!date) {
@@ -1282,20 +1435,20 @@ async function handleMention({ event, client, say }) {
     }
     console.log(`[요청] 2/4 날짜 파싱 완료 date=${date}`);
 
-    const requesterName = memberNameById(event.user);
-    console.log(`[요청] 3/4 요청자 조회 user=${event.user} → name=${requesterName || 'null'} (멤버 시트 ${Object.keys(sheetCache.members).length}명 로드됨)`);
+    const requesterName = memberNameById(team, event.user);
+    console.log(`[요청] 3/4 요청자 조회 user=${event.user} → name=${requesterName || 'null'} (${team.label} 멤버 시트 ${Object.keys(team.sheetCache.members).length}명 로드됨)`);
     if (!requesterName) {
       // 예전엔 여기서 role=null로 흡수돼 원인을 알 수 없었다 — 이제 별도로 안내한다
       await replyEphemeral({
         client, say, event, threadTs,
-        text: `❌ 멤버 시트에서 <@${event.user}> 님을 찾지 못했어요.\n시트의 슬랙ID 열을 확인하시고, 방금 수정했다면 \`@당번봇 캐시갱신\` 후 다시 시도해주세요.`,
+        text: `❌ ${team.label} 멤버 시트에서 <@${event.user}> 님을 찾지 못했어요.\n시트의 슬랙ID 열을 확인하시고, 방금 수정했다면 \`@당번봇 캐시갱신\` 후 다시 시도해주세요.`,
       });
       return;
     }
 
-    const mainName = getMain(date).name || '—';
-    const checkName = getCheck(date).name || '—';
-    const role = requesterRole(date, requesterName);
+    const mainName = getMain(team, date).name || '—';
+    const checkName = getCheck(team, date).name || '—';
+    const role = requesterRole(team, date, requesterName);
     console.log(`[요청] 4/4 역할 판별 date=${date} 요청자=${requesterName} 메인=${mainName} 크첵=${checkName} → role=${role || 'null'}`);
     if (!role) {
       await replyEphemeral({
@@ -1309,7 +1462,7 @@ async function handleMention({ event, client, say }) {
     const val = JSON.stringify({ date, role });
     // 주간 스레드에 올라가는 공개 메시지이므로 누구의 요청인지 함께 표시한다
     await replyWeekly(`${requesterName} 님의 ${dateLabel(date)} ${roleLabel} 당번 요청`, [
-      { type: 'section', text: { type: 'mrkdwn', text: `🙏 ${mentionTag(requesterName)} 님의 *${dateLabel(date)}* ${roleLabel} 당번 요청\n어떤 방식으로 요청할까요?` } },
+      { type: 'section', text: { type: 'mrkdwn', text: `🙏 ${mentionTag(team, requesterName)} 님의 *${dateLabel(date)}* ${roleLabel} 당번 요청\n어떤 방식으로 요청할까요?` } },
       { type: 'actions', elements: [
         { type: 'button', text: { type: 'plain_text', text: '🙋 대리 요청' }, style: 'primary', action_id: 'req_delegate', value: val },
         { type: 'button', text: { type: 'plain_text', text: '🔄 날짜 교체' }, action_id: 'req_swap', value: val },
@@ -1324,8 +1477,8 @@ async function handleMention({ event, client, say }) {
     const parsed = parts.length === 3 ? parseLeaveArgs(`${parts[1]} ${parts[2]}`) : null;
     if (!parsed) { await reply('❌ 사용법: `@당번봇 연차 홍길동 MM.DD~MM.DD`'); return; }
     const { name, dates, rangeStr } = parsed;
-    addLeave(name, dates);
-    await persistLeaveAdd(name, dates[0], dates[dates.length - 1]);
+    addLeave(team, name, dates);
+    await persistLeaveAdd(team, name, dates[0], dates[dates.length - 1]);
     await replyWeekly(`🏖️ *${name}* 님 연차 등록 완료 (${rangeStr}, ${dates.length}일)`);
     return;
   }
@@ -1335,9 +1488,9 @@ async function handleMention({ event, client, say }) {
     const parsed = parts.length === 3 ? parseLeaveArgs(`${parts[1]} ${parts[2]}`) : null;
     if (!parsed) { await reply('❌ 사용법: `@당번봇 연차취소 홍길동 MM.DD~MM.DD`'); return; }
     const { name, dates, rangeStr } = parsed;
-    const removed = removeLeave(name, dates);
+    const removed = removeLeave(team, name, dates);
     if (removed > 0) {
-      await persistLeaveRemove(name, dates[0], dates[dates.length - 1]);
+      await persistLeaveRemove(team, name, dates[0], dates[dates.length - 1]);
       await replyWeekly(`↩️ *${name}* 님 연차 취소 완료 (${rangeStr}, ${removed}일)`);
     } else {
       await reply(`ℹ️ *${name}* 님의 해당 날짜 연차가 없어요.`);
@@ -1347,15 +1500,15 @@ async function handleMention({ event, client, say }) {
 
   // 연차확인
   if (cmd === '연차확인') {
-    await reply(leaveListText()); return;
+    await reply(leaveListText(team)); return;
   }
 
   // MM.DD — 특정 날짜 당번 조회
   const dateQuery = parseDate(cmd);
   if (dateQuery) {
-    const { name: main } = getMain(dateQuery);
-    const { name: check } = getCheck(dateQuery);
-    const line = main ? formatDutyLine(main, check, false) : '—';
+    const { name: main } = getMain(team, dateQuery);
+    const { name: check } = getCheck(team, dateQuery);
+    const line = main ? formatDutyLine(team, main, check, false) : '—';
     await reply(`📅 *${dateLabel(dateQuery)}* 당번: ${line} 님`); return;
   }
 
@@ -1366,7 +1519,11 @@ async function handleMention({ event, client, say }) {
 // ─── 서버 시작 ────────────────────────────────────────
 if (require.main === module) {
   (async () => {
-    await refreshAll({ updateThread: false });
+    for (const team of TEAMS) {
+      if (!team.channel) console.warn(`[시작][${team.label}] 채널 환경변수가 없어요 — 이 팀은 동작하지 않아요`);
+      await refreshAll(team, { updateThread: false });
+      console.log(`[시작][${team.label}] ch=${team.channel} ${isOperating(team) ? '운영 중' : '운영 전'}`);
+    }
     await app.start(process.env.PORT || 3000);
     const authResult = await app.client.auth.test();
     botUserId = authResult.user_id;
@@ -1376,12 +1533,15 @@ if (require.main === module) {
 
 // 검증 스크립트용 (require 했을 때만 사용, 봇 실행에는 영향 없음)
 module.exports = {
+  TEAMS, teamByChannel, isOperating, notOperatingText,
   getMain, getCheck, addLeave, removeLeave, isOnLeave,
   upcomingOverrideCount, upcomingLeaveCount,
-  _setOverrides: (o) => {
-    for (const k of Object.keys(overrides)) delete overrides[k];
-    Object.assign(overrides, o);
+  weeklyMessage, memberNameById, handleMention, forEachOperatingTeam, ensureWeeklyThread,
+  loadSheets,
+  _setOverrides: (team, o) => {
+    for (const k of Object.keys(team.overrides)) delete team.overrides[k];
+    Object.assign(team.overrides, o);
   },
-  _setSheetCache: (c) => { sheetCache = c; invalidateRotation(); },
-  _resetLeaves: () => { for (const k of Object.keys(leaves)) delete leaves[k]; invalidateRotation(); },
+  _setSheetCache: (team, c) => { team.sheetCache = c; invalidateRotation(team); },
+  _resetLeaves: (team) => { for (const k of Object.keys(team.leaves)) delete team.leaves[k]; invalidateRotation(team); },
 };
