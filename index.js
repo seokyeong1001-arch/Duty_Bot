@@ -2,85 +2,6 @@ const { App } = require('@slack/bolt');
 const cron = require('node-cron');
 const { google } = require('googleapis');
 
-// ─── Railway 환경변수 API ──────────────────────────────
-function railwayHeaders() {
-  return {
-    'Authorization': `Bearer ${process.env.RAILWAY_API_TOKEN}`,
-    'Content-Type': 'application/json',
-  };
-}
-
-function railwayIds() {
-  return {
-    projectId: process.env.RAILWAY_PROJECT_ID,
-    environmentId: process.env.RAILWAY_ENVIRONMENT_ID,
-    serviceId: process.env.RAILWAY_SERVICE_ID,
-  };
-}
-
-function hasRailwayCreds() {
-  const { projectId, environmentId, serviceId } = railwayIds();
-  return !!(process.env.RAILWAY_API_TOKEN && projectId && environmentId && serviceId);
-}
-
-const RAILWAY_GQL_URL = 'https://backboard.railway.app/graphql/v2';
-
-// Railway GraphQL 호출 하나. 실패하면 호출 대상·HTTP 상태·응답 원문 전체를 로그로 남기고
-// 메시지 앞에 [Railway <작업>] 을 붙여 던진다 — 상위 로그만 봐도 어디서 실패했는지 보이게.
-async function railwayGraphql(op, query, variables) {
-  const { projectId, environmentId, serviceId } = railwayIds();
-  const target = `POST ${RAILWAY_GQL_URL} op=${op} project=${projectId} env=${environmentId} service=${serviceId}`;
-  let res, bodyText;
-  try {
-    res = await fetch(RAILWAY_GQL_URL, {
-      method: 'POST',
-      headers: railwayHeaders(),
-      body: JSON.stringify({ query, variables }),
-    });
-    bodyText = await res.text();
-  } catch (e) {
-    console.error(`[외부호출 실패][Railway ${op}] 네트워크 오류 대상=${target}\n`, e);
-    throw new Error(`[Railway ${op}] 네트워크 오류: ${e.message}`);
-  }
-  let json;
-  try {
-    json = JSON.parse(bodyText);
-  } catch {
-    console.error(`[외부호출 실패][Railway ${op}] JSON 아님 대상=${target} http=${res.status}\n응답 원문: ${bodyText}`);
-    throw new Error(`[Railway ${op}] http=${res.status} 응답이 JSON 아님`);
-  }
-  if (!res.ok || json.errors) {
-    console.error(`[외부호출 실패][Railway ${op}] 대상=${target} http=${res.status}\n응답 원문: ${bodyText}`);
-    const msg = json.errors ? json.errors.map(er => er.message).join(' | ') : `http ${res.status}`;
-    throw new Error(`[Railway ${op}] ${msg}`);
-  }
-  return json.data;
-}
-
-// 팀별 주간 스레드 ts 는 Railway 변수 team.threadVar 에 둔다.
-// 아직 팀별 변수가 없으면 legacyThreadVar(구 WEEKLY_THREAD_TS)로 폴백한다 — 파인트팀만 해당.
-async function getThreadTs(team) {
-  if (!hasRailwayCreds()) return null;
-  const { projectId, environmentId, serviceId } = railwayIds();
-  const data = await railwayGraphql(`variables 조회(${team.label})`, `
-        query Variables($projectId: String!, $environmentId: String!, $serviceId: String!) {
-          variables(projectId: $projectId, environmentId: $environmentId, serviceId: $serviceId)
-        }
-      `, { projectId, environmentId, serviceId });
-  const vars = data.variables || {};
-  return vars[team.threadVar] || (team.legacyThreadVar && vars[team.legacyThreadVar]) || null;
-}
-
-async function setThreadTs(team, ts) {
-  if (!hasRailwayCreds()) return;
-  const { projectId, environmentId, serviceId } = railwayIds();
-  await railwayGraphql(`variableUpsert ${team.threadVar}(${team.label})`, `
-        mutation VariableUpsert($input: VariableUpsertInput!) {
-          variableUpsert(input: $input)
-        }
-      `, { input: { projectId, environmentId, serviceId, name: team.threadVar, value: ts } });
-}
-
 // Slack Web API 호출 하나. 실패하면 메서드·채널·thread_ts 와 에러 원문(e.data 전체)을 로그로 남기고
 // 메시지 앞에 [Slack <메서드>] 를 붙여 다시 던진다.
 async function slackCall(method, args) {
@@ -115,7 +36,10 @@ function createTeam({ key, label, prefix, channel, threadVar, legacyThreadVar = 
       checkLoop: `${prefix}_크첵루프`,
       override: `${prefix}_변경`,
       leave: `${prefix}_연차`,
+      settings: `${prefix}_설정`, // 키 | 값 | 갱신시각 — 주간 스레드 ts 등 봇이 기억해야 하는 값
     },
+    // 이번 주 주간 스레드 ts. 정본은 <팀>_설정 탭이고, 여기는 메모리 사본(시트 쓰기가 실패해도 이걸로 계속 돈다)
+    threadTs: null,
     // 변경 탭을 새로 만들 때만 넣는 1회성 시드 (메모리 → 시트 이관용)
     seedOverrides,
     sheetCache: { members: {}, loop: [], checkLoop: [], startDate: '' },
@@ -307,7 +231,7 @@ async function ensureTabs(team) {
 
   const created = [];
   const requests = [];
-  for (const title of [OVERRIDE_TAB, LEAVE_TAB]) {
+  for (const title of [OVERRIDE_TAB, LEAVE_TAB, team.tabs.settings]) {
     if (!(title in bySheet)) { requests.push({ addSheet: { properties: { title } } }); created.push(title); }
   }
   if (requests.length) {
@@ -322,6 +246,7 @@ async function ensureTabs(team) {
 
   await ensureHeader(OVERRIDE_TAB, ['날짜', '메인', '크첵']);
   await ensureHeader(LEAVE_TAB, ['이름', '시작일', '종료일']);
+  await ensureHeader(team.tabs.settings, ['키', '값', '갱신시각']);
 
   // 변경 탭을 이번에 새로 만든 경우에만 기존 메모리 값 시드
   if (created.includes(OVERRIDE_TAB) && team.seedOverrides.length) {
@@ -444,6 +369,46 @@ async function persistLeaveRemove(team, name, startStr, endStr) {
   }
 }
 
+// ─── 설정 탭 (키 | 값 | 갱신시각) ─────────────────────
+const SETTING_THREAD_TS = '주간스레드ts';
+
+async function readSetting(team, key) {
+  const sheets = getSheetsClient();
+  const res = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${team.tabs.settings}!A2:B` });
+  const row = (res.data.values || []).find(r => (r[0] || '').trim() === key);
+  return row ? String(row[1] || '').trim() || null : null;
+}
+
+// 변경 탭과 같은 패턴: 키(A열)로 행을 찾아 있으면 덮어쓰고 없으면 추가한다.
+// 실패하면 로그만 남기고 false — 호출부는 메모리 값으로 계속 돈다.
+async function writeSetting(team, key, value) {
+  if (!hasSheetsCreds()) return false;
+  const TAB = team.tabs.settings;
+  try {
+    const sheets = getSheetsClient();
+    const res = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${TAB}!A2:A` });
+    const idx = (res.data.values || []).findIndex(r => (r[0] || '').trim() === key);
+    const at = new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Seoul' });
+    const values = [[key, String(value), at]];
+    if (idx >= 0) {
+      const rowNum = idx + 2; // +1 헤더, +1 1-based
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: SHEET_ID, range: `${TAB}!A${rowNum}:C${rowNum}`,
+        valueInputOption: 'RAW', requestBody: { values },
+      });
+    } else {
+      await sheets.spreadsheets.values.append({
+        spreadsheetId: SHEET_ID, range: `${TAB}!A1`,
+        valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS', requestBody: { values },
+      });
+    }
+    return true;
+  } catch (e) {
+    console.error(`[영구저장][${team.label}] 설정 저장 실패 ${key}=${value}:`, e.message);
+    return false;
+  }
+}
+
 // 서버 시작/캐시갱신 시 팀의 변경/연차 탭을 읽어 메모리에 로드
 async function loadPersisted(team) {
   if (!hasSheetsCreds()) {
@@ -477,9 +442,14 @@ async function loadPersisted(team) {
       addLeave(team, name, expandRange(start, end));
     }
 
+    // 설정 — 주간 스레드 ts (메모리에 더 최근 값이 있으면 그걸 지킨다: 시트 쓰기만 실패했던 경우)
+    const sheetTs = await readSetting(team, SETTING_THREAD_TS);
+    if (sheetTs && (!team.threadTs || parseFloat(sheetTs) > parseFloat(team.threadTs))) team.threadTs = sheetTs;
+
     console.log(
       `[영구저장][${team.label}] 로드 완료 — 변경 ${Object.keys(overrides).length}건(유효 ${upcomingOverrideCount(team)}건) / ` +
-      `연차 ${Object.keys(leaves).length}명(유효 ${upcomingLeaveCount(team)}명)`
+      `연차 ${Object.keys(leaves).length}명(유효 ${upcomingLeaveCount(team)}명) / ` +
+      `주간스레드 ${team.threadTs || '없음'}`
     );
   } catch (e) {
     console.error(`[영구저장][${team.label}] 로드 실패:`, e.message);
@@ -893,17 +863,88 @@ function formatWeekDates(team, dates) {
 }
 
 // ─── 주간 스레드 ──────────────────────────────────────
+// 이번 주 스레드 ts 는 Railway API 를 쓰지 않는다. 찾는 순서:
+//   메모리 → <팀>_설정 탭 → Railway 가 넣어 둔 환경변수(첫 이관용, API 호출 없음) → 채널 최근 글 검색
+// 지난주 ts 는 쓰지 않는다 — 이번 주 것이 아니면 없는 것으로 보고 새로 찾거나 만든다.
+function kstDateOfTs(ts) {
+  return new Date(parseFloat(ts) * 1000).toLocaleDateString('sv-SE', { timeZone: 'Asia/Seoul' });
+}
+
+function mondayOf(dateStr) {
+  const d = new Date(`${dateStr}T00:00:00Z`);
+  const dow = d.getUTCDay();
+  d.setUTCDate(d.getUTCDate() - (dow === 0 ? 6 : dow - 1));
+  return d.toISOString().slice(0, 10);
+}
+
+function isThisWeekTs(ts) {
+  if (!ts || isNaN(parseFloat(ts))) return false;
+  return mondayOf(kstDateOfTs(ts)) === mondayOf(todayStr());
+}
+
+const WEEKLY_HEAD_RE = /^📅 \*\d+월 \d+주차 당번 일정\*/;
+
+// 채널에서 이번 주 월요일 00:00(KST) 이후 봇이 올린 주간 일정 글을 찾는다 (가장 먼저 올린 것).
+// 시트·메모리가 다 비었을 때 같은 주에 스레드를 또 만들지 않기 위한 마지막 확인.
+async function findThisWeekThreadInChannel(team) {
+  if (!botUserId) return null;
+  const oldest = String(Date.parse(`${mondayOf(todayStr())}T00:00:00+09:00`) / 1000);
+  try {
+    const res = await slackCall('conversations.history', { channel: team.channel, oldest, limit: 200 });
+    const hits = (res.messages || [])
+      .filter(m => m.user === botUserId && (!m.thread_ts || m.thread_ts === m.ts) && WEEKLY_HEAD_RE.test(m.text || ''))
+      .sort((a, b) => parseFloat(a.ts) - parseFloat(b.ts));
+    return hits[0]?.ts || null;
+  } catch (e) {
+    console.warn(`[주간스레드][${team.label}] 채널 검색 실패 — 건너뜀: ${e.message}`);
+    return null;
+  }
+}
+
+// 이번 주 스레드 ts 를 찾기만 한다 (만들지 않음). 없으면 null.
+async function currentThreadTs(team) {
+  if (isThisWeekTs(team.threadTs)) return team.threadTs;
+
+  if (hasSheetsCreds()) {
+    try {
+      const ts = await readSetting(team, SETTING_THREAD_TS);
+      if (isThisWeekTs(ts)) {
+        team.threadTs = ts;
+        return ts;
+      }
+    } catch (e) {
+      console.warn(`[주간스레드][${team.label}] 설정 탭 읽기 실패 — 다음 경로로: ${e.message}`);
+    }
+  }
+
+  const envTs = process.env[team.threadVar] || (team.legacyThreadVar && process.env[team.legacyThreadVar]);
+  if (isThisWeekTs(envTs)) {
+    console.log(`[주간스레드][${team.label}] 환경변수 ${team.threadVar} 값을 시트로 옮김 ts=${envTs}`);
+    await setThreadTs(team, envTs);
+    return envTs;
+  }
+
+  const found = await findThisWeekThreadInChannel(team);
+  if (found) {
+    console.log(`[주간스레드][${team.label}] 채널에서 이번 주 스레드를 찾음 ts=${found}`);
+    await setThreadTs(team, found);
+    return found;
+  }
+  return null;
+}
+
+// 메모리에 먼저 넣고 시트에 쓴다. 시트 쓰기가 실패해도 메모리 값으로 계속 돈다.
+async function setThreadTs(team, ts) {
+  team.threadTs = ts;
+  const ok = await writeSetting(team, SETTING_THREAD_TS, ts);
+  console.log(`[주간스레드][${team.label}] ts=${ts} 저장 — 메모리 OK / 시트 ${ok ? 'OK' : '실패(메모리만)'}`);
+}
+
 async function updateWeeklyThread(team) {
   try {
-    const ts = await getThreadTs(team);
+    const ts = await currentThreadTs(team);
     if (!ts) return;
-    const threadDate = new Date(parseFloat(ts) * 1000);
-    const threadDateStr = threadDate.toLocaleDateString('sv-SE', { timeZone: 'Asia/Seoul' });
-    const d = new Date(threadDateStr);
-    const dow = d.getDay();
-    const monday = new Date(d);
-    monday.setDate(d.getDate() - (dow === 0 ? 6 : dow - 1));
-    const mondayStr = monday.toLocaleDateString('sv-SE');
+    const mondayStr = mondayOf(kstDateOfTs(ts));
     const weekLabel = getWeekLabel(mondayStr);
     await slackCall('chat.update', {
       channel: team.channel,
@@ -915,19 +956,42 @@ async function updateWeeklyThread(team) {
   }
 }
 
+// 이번 주 스레드를 찾고, 없으면 만든다.
 async function ensureWeeklyThread(team) {
-  const ts = await getThreadTs(team);
+  const ts = await currentThreadTs(team);
   if (ts) return ts;
   // 운영 전 팀은 주간 스레드를 만들지 않는다 (빈 일정 스레드가 채널에 남지 않도록)
   if (!isOperating(team)) throw new Error(`${team.label} 운영 전이라 주간 스레드를 만들지 않아요.`);
-  const today = todayStr();
-  const weekLabel = getWeekLabel(today);
-  const res = await app.client.chat.postMessage({
+  const monday = mondayOf(todayStr());
+  const res = await slackCall('chat.postMessage', {
     channel: team.channel,
-    text: `📅 *${weekLabel} 당번 일정*\n\n${weeklyMessage(team, today)}`,
+    text: `📅 *${getWeekLabel(monday)} 당번 일정*\n\n${weeklyMessage(team, monday)}`,
   });
+  console.log(`[주간스레드][${team.label}] 새 스레드 생성 ts=${res.ts}`);
   await setThreadTs(team, res.ts);
   return res.ts;
+}
+
+// 자동 알림 게시. 주간 스레드 답글이 기본이고, 스레드를 못 구하거나 답글이 실패하면
+// 채널 본문에라도 올린다 — 어떤 경우에도 알림 자체는 나가게.
+async function postAlert(team, jobName, text) {
+  let ts = null;
+  try {
+    ts = await ensureWeeklyThread(team);
+  } catch (e) {
+    console.error(`[${jobName}][${team.label}] 주간 스레드 확보 실패 — 채널 본문으로 보냄: ${e.message}`);
+  }
+  if (ts) {
+    try {
+      await slackCall('chat.postMessage', { channel: team.channel, thread_ts: ts, text });
+      console.log(`[${jobName}][${team.label}] 게시 완료 (스레드 ${ts})`);
+      return;
+    } catch (e) {
+      console.error(`[${jobName}][${team.label}] 스레드 답글 실패 — 채널 본문으로 보냄: ${e.message}`);
+    }
+  }
+  await slackCall('chat.postMessage', { channel: team.channel, text });
+  console.log(`[${jobName}][${team.label}] 게시 완료 (채널 본문 폴백)`);
 }
 
 // 팀 주간 스레드에 답글로 게시한다. 스레드가 없으면 ensureWeeklyThread() 로 먼저 확보.
@@ -1269,29 +1333,15 @@ async function forEachOperatingTeam(jobName, fn) {
 }
 
 // ─── 매주 월요일 07:00 — 새 주간 스레드 생성 ──────────
+// 이번 주 스레드가 이미 있으면(월요일 새벽 명령으로 먼저 생긴 경우 등) 새로 만들지 않는다.
 cron.schedule(CONFIG.weeklyTime, () => forEachOperatingTeam('주간스레드', async (team) => {
-  const today = todayStr();
-  const weekLabel = getWeekLabel(today);
-  const res = await app.client.chat.postMessage({
-    channel: team.channel,
-    text: `📅 *${weekLabel} 당번 일정*\n\n${weeklyMessage(team, today)}`,
-  });
-  try {
-    await setThreadTs(team, res.ts);
-  } catch (e) {
-    console.error(`[${team.label}] Railway 환경변수 업데이트 실패:`, e.message);
-  }
+  const ts = await ensureWeeklyThread(team);
+  console.log(`[주간스레드][${team.label}] 이번 주 스레드 ts=${ts}`);
 }), { timezone: 'Asia/Seoul' });
 
 // ─── 매일 07:30 — 오늘 당번 알림 + 태그 ──────────────
 cron.schedule(CONFIG.notifyTime, () => forEachOperatingTeam('오늘알림', async (team) => {
-  const today = todayStr();
-  const ts = await ensureWeeklyThread(team);
-  await slackCall('chat.postMessage', {
-    channel: team.channel,
-    thread_ts: ts,
-    text: dutyMessage(team, today, true),
-  });
+  await postAlert(team, '오늘알림', dutyMessage(team, todayStr(), true));
 }), { timezone: 'Asia/Seoul' });
 
 // ─── 매일 18:00 — 내일 당번 예고 + 태그 ──────────────
@@ -1299,12 +1349,7 @@ cron.schedule(CONFIG.eveningNotifyTime, () => forEachOperatingTeam('내일예고
   const tomorrow = new Date();
   tomorrow.setDate(tomorrow.getDate() + 1);
   const tomorrowStr = tomorrow.toLocaleDateString('sv-SE', { timeZone: 'Asia/Seoul' });
-  const ts = await ensureWeeklyThread(team);
-  await slackCall('chat.postMessage', {
-    channel: team.channel,
-    thread_ts: ts,
-    text: eveningMessage(team, tomorrowStr, true),
-  });
+  await postAlert(team, '내일예고', eveningMessage(team, tomorrowStr, true));
 }), { timezone: 'Asia/Seoul' });
 
 // ─── @당번봇 멘션 처리 ────────────────────────────────
@@ -1569,17 +1614,8 @@ if (require.main === module) {
     const authResult = await app.client.auth.test();
     botUserId = authResult.user_id;
     console.log('⚡ 당번 봇이 실행 중입니다! Bot ID:', botUserId);
-    // 알림은 매번 Railway 에서 스레드 ts 를 읽으므로, 시작할 때 한 번 미리 점검해 로그로 남긴다
-    if (!hasRailwayCreds()) {
-      console.warn('[시작][Railway 점검] RAILWAY_API_TOKEN/PROJECT/ENVIRONMENT/SERVICE_ID 중 비어 있는 값이 있어요 — 스레드 ts 를 못 읽어요');
-    }
     for (const team of TEAMS) {
-      try {
-        const ts = await getThreadTs(team);
-        console.log(`[시작][Railway 점검][${team.label}] ${team.threadVar}=${ts || '(없음)'}`);
-      } catch (e) {
-        console.error(`[시작][Railway 점검][${team.label}] 실패: ${e.message}`);
-      }
+      console.log(`[시작][${team.label}] 주간스레드 ${isThisWeekTs(team.threadTs) ? team.threadTs : '이번 주 것 없음 (첫 알림 때 찾거나 만듦)'}`);
     }
   })();
 }
@@ -1589,8 +1625,9 @@ module.exports = {
   TEAMS, teamByChannel, isOperating, notOperatingText,
   getMain, getCheck, addLeave, removeLeave, isOnLeave,
   upcomingOverrideCount, upcomingLeaveCount,
-  weeklyMessage, memberNameById, handleMention, forEachOperatingTeam, ensureWeeklyThread,
+  weeklyMessage, memberNameById, handleMention, forEachOperatingTeam, ensureWeeklyThread, currentThreadTs, postAlert, mondayOf, isThisWeekTs,
   loadSheets,
+  _setBotUserId: (id) => { botUserId = id; },
   _setOverrides: (team, o) => {
     for (const k of Object.keys(team.overrides)) delete team.overrides[k];
     Object.assign(team.overrides, o);
