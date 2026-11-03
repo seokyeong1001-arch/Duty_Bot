@@ -372,11 +372,47 @@ async function persistLeaveRemove(team, name, startStr, endStr) {
 // ─── 설정 탭 (키 | 값 | 갱신시각) ─────────────────────
 const SETTING_THREAD_TS = '주간스레드ts';
 
+// 셀 값을 변환 없이 그대로 돌려준다 (없으면 null).
+// UNFORMATTED_VALUE 로 읽는다 — 기본값 FORMATTED_VALUE 는 숫자 셀을 표시 형식대로 줘서
+// 1793570400.714519 가 "1793570401" 로 잘려 온다. 이렇게 읽으면 텍스트 셀은 string, 숫자 셀은 number 로 와서 구분된다.
 async function readSetting(team, key) {
   const sheets = getSheetsClient();
-  const res = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${team.tabs.settings}!A2:B` });
-  const row = (res.data.values || []).find(r => (r[0] || '').trim() === key);
-  return row ? String(row[1] || '').trim() || null : null;
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID, range: `${team.tabs.settings}!A2:B`, valueRenderOption: 'UNFORMATTED_VALUE',
+  });
+  const row = (res.data.values || []).find(r => String(r[0] ?? '').trim() === key);
+  return row && row[1] !== undefined && row[1] !== '' ? row[1] : null;
+}
+
+// 슬랙 ts 는 항상 문자열 "초.마이크로초(6자리)". 숫자로 바꾸면 소수점 자리가 깨지므로 문자열로만 다룬다.
+const SLACK_TS_RE = /^\d{9,11}\.\d{6}$/;
+function isValidTs(ts) {
+  return typeof ts === 'string' && SLACK_TS_RE.test(ts);
+}
+
+// 문자열 그대로 비교 (정수부 길이 → 정수부 → 소수부). 음수면 a 가 더 이르다.
+function compareTs(a, b) {
+  const [ai, af] = a.split('.');
+  const [bi, bf] = b.split('.');
+  return (ai.length - bi.length) || ai.localeCompare(bi) || af.localeCompare(bf);
+}
+
+// 설정 탭의 주간스레드ts 를 읽어 원본 그대로 로그로 남기고, 올바른 ts 문자열일 때만 돌려준다.
+// 숫자 셀이거나 형식이 틀리면 null — 호출부가 다른 경로로 ts 를 찾고, 찾으면 텍스트로 다시 써서 고쳐진다.
+async function readThreadTsSetting(team, where) {
+  const raw = await readSetting(team, SETTING_THREAD_TS);
+  console.log(`[설정][${team.label}] ${where} ${SETTING_THREAD_TS} 원본=${JSON.stringify(raw)} 타입=${typeof raw}`);
+  if (raw === null) return null;
+  if (typeof raw !== 'string') {
+    console.warn(`[설정][${team.label}] ${SETTING_THREAD_TS} 가 숫자 셀이에요 — 소수점이 깨졌을 수 있어 쓰지 않아요 (다른 경로로 찾으면 텍스트로 다시 써요)`);
+    return null;
+  }
+  const ts = raw.trim();
+  if (!isValidTs(ts)) {
+    console.warn(`[설정][${team.label}] ${SETTING_THREAD_TS} 형식이 슬랙 ts(초.6자리)가 아니에요 — 쓰지 않아요: ${JSON.stringify(raw)}`);
+    return null;
+  }
+  return ts;
 }
 
 // 변경 탭과 같은 패턴: 키(A열)로 행을 찾아 있으면 덮어쓰고 없으면 추가한다.
@@ -389,6 +425,7 @@ async function writeSetting(team, key, value) {
     const res = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${TAB}!A2:A` });
     const idx = (res.data.values || []).findIndex(r => (r[0] || '').trim() === key);
     const at = new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Seoul' });
+    // RAW 로 문자열을 쓰면 시트가 숫자로 해석하지 않고 텍스트 셀로 저장한다 (USER_ENTERED 면 ts 가 숫자가 된다)
     const values = [[key, String(value), at]];
     if (idx >= 0) {
       const rowNum = idx + 2; // +1 헤더, +1 1-based
@@ -443,8 +480,8 @@ async function loadPersisted(team) {
     }
 
     // 설정 — 주간 스레드 ts (메모리에 더 최근 값이 있으면 그걸 지킨다: 시트 쓰기만 실패했던 경우)
-    const sheetTs = await readSetting(team, SETTING_THREAD_TS);
-    if (sheetTs && (!team.threadTs || parseFloat(sheetTs) > parseFloat(team.threadTs))) team.threadTs = sheetTs;
+    const sheetTs = await readThreadTsSetting(team, '로드');
+    if (sheetTs && (!isValidTs(team.threadTs) || compareTs(sheetTs, team.threadTs) > 0)) team.threadTs = sheetTs;
 
     console.log(
       `[영구저장][${team.label}] 로드 완료 — 변경 ${Object.keys(overrides).length}건(유효 ${upcomingOverrideCount(team)}건) / ` +
@@ -866,8 +903,9 @@ function formatWeekDates(team, dates) {
 // 이번 주 스레드 ts 는 Railway API 를 쓰지 않는다. 찾는 순서:
 //   메모리 → <팀>_설정 탭 → Railway 가 넣어 둔 환경변수(첫 이관용, API 호출 없음) → 채널 최근 글 검색
 // 지난주 ts 는 쓰지 않는다 — 이번 주 것이 아니면 없는 것으로 보고 새로 찾거나 만든다.
+// 날짜 계산에는 ts 의 정수부(초)만 쓴다 — ts 값 자체는 언제나 문자열로 둔다
 function kstDateOfTs(ts) {
-  return new Date(parseFloat(ts) * 1000).toLocaleDateString('sv-SE', { timeZone: 'Asia/Seoul' });
+  return new Date(Number(ts.split('.')[0]) * 1000).toLocaleDateString('sv-SE', { timeZone: 'Asia/Seoul' });
 }
 
 function mondayOf(dateStr) {
@@ -878,7 +916,7 @@ function mondayOf(dateStr) {
 }
 
 function isThisWeekTs(ts) {
-  if (!ts || isNaN(parseFloat(ts))) return false;
+  if (!isValidTs(ts)) return false;
   return mondayOf(kstDateOfTs(ts)) === mondayOf(todayStr());
 }
 
@@ -893,7 +931,8 @@ async function findThisWeekThreadInChannel(team) {
     const res = await slackCall('conversations.history', { channel: team.channel, oldest, limit: 200 });
     const hits = (res.messages || [])
       .filter(m => m.user === botUserId && (!m.thread_ts || m.thread_ts === m.ts) && WEEKLY_HEAD_RE.test(m.text || ''))
-      .sort((a, b) => parseFloat(a.ts) - parseFloat(b.ts));
+      .filter(m => isValidTs(m.ts))
+      .sort((a, b) => compareTs(a.ts, b.ts));
     return hits[0]?.ts || null;
   } catch (e) {
     console.warn(`[주간스레드][${team.label}] 채널 검색 실패 — 건너뜀: ${e.message}`);
@@ -907,7 +946,7 @@ async function currentThreadTs(team) {
 
   if (hasSheetsCreds()) {
     try {
-      const ts = await readSetting(team, SETTING_THREAD_TS);
+      const ts = await readThreadTsSetting(team, '조회');
       if (isThisWeekTs(ts)) {
         team.threadTs = ts;
         return ts;
@@ -935,6 +974,10 @@ async function currentThreadTs(team) {
 
 // 메모리에 먼저 넣고 시트에 쓴다. 시트 쓰기가 실패해도 메모리 값으로 계속 돈다.
 async function setThreadTs(team, ts) {
+  if (!isValidTs(ts)) {
+    console.error(`[주간스레드][${team.label}] 올바른 ts 문자열이 아니라 저장하지 않아요: ${JSON.stringify(ts)} (${typeof ts})`);
+    return;
+  }
   team.threadTs = ts;
   const ok = await writeSetting(team, SETTING_THREAD_TS, ts);
   console.log(`[주간스레드][${team.label}] ts=${ts} 저장 — 메모리 OK / 시트 ${ok ? 'OK' : '실패(메모리만)'}`);
