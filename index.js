@@ -23,48 +23,77 @@ function hasRailwayCreds() {
   return !!(process.env.RAILWAY_API_TOKEN && projectId && environmentId && serviceId);
 }
 
+const RAILWAY_GQL_URL = 'https://backboard.railway.app/graphql/v2';
+
+// Railway GraphQL 호출 하나. 실패하면 호출 대상·HTTP 상태·응답 원문 전체를 로그로 남기고
+// 메시지 앞에 [Railway <작업>] 을 붙여 던진다 — 상위 로그만 봐도 어디서 실패했는지 보이게.
+async function railwayGraphql(op, query, variables) {
+  const { projectId, environmentId, serviceId } = railwayIds();
+  const target = `POST ${RAILWAY_GQL_URL} op=${op} project=${projectId} env=${environmentId} service=${serviceId}`;
+  let res, bodyText;
+  try {
+    res = await fetch(RAILWAY_GQL_URL, {
+      method: 'POST',
+      headers: railwayHeaders(),
+      body: JSON.stringify({ query, variables }),
+    });
+    bodyText = await res.text();
+  } catch (e) {
+    console.error(`[외부호출 실패][Railway ${op}] 네트워크 오류 대상=${target}\n`, e);
+    throw new Error(`[Railway ${op}] 네트워크 오류: ${e.message}`);
+  }
+  let json;
+  try {
+    json = JSON.parse(bodyText);
+  } catch {
+    console.error(`[외부호출 실패][Railway ${op}] JSON 아님 대상=${target} http=${res.status}\n응답 원문: ${bodyText}`);
+    throw new Error(`[Railway ${op}] http=${res.status} 응답이 JSON 아님`);
+  }
+  if (!res.ok || json.errors) {
+    console.error(`[외부호출 실패][Railway ${op}] 대상=${target} http=${res.status}\n응답 원문: ${bodyText}`);
+    const msg = json.errors ? json.errors.map(er => er.message).join(' | ') : `http ${res.status}`;
+    throw new Error(`[Railway ${op}] ${msg}`);
+  }
+  return json.data;
+}
+
 // 팀별 주간 스레드 ts 는 Railway 변수 team.threadVar 에 둔다.
 // 아직 팀별 변수가 없으면 legacyThreadVar(구 WEEKLY_THREAD_TS)로 폴백한다 — 파인트팀만 해당.
 async function getThreadTs(team) {
   if (!hasRailwayCreds()) return null;
   const { projectId, environmentId, serviceId } = railwayIds();
-  const res = await fetch('https://backboard.railway.app/graphql/v2', {
-    method: 'POST',
-    headers: railwayHeaders(),
-    body: JSON.stringify({
-      query: `
+  const data = await railwayGraphql(`variables 조회(${team.label})`, `
         query Variables($projectId: String!, $environmentId: String!, $serviceId: String!) {
           variables(projectId: $projectId, environmentId: $environmentId, serviceId: $serviceId)
         }
-      `,
-      variables: { projectId, environmentId, serviceId },
-    }),
-  });
-  const json = await res.json();
-  if (json.errors) throw new Error(json.errors[0].message);
-  const vars = json.data.variables || {};
+      `, { projectId, environmentId, serviceId });
+  const vars = data.variables || {};
   return vars[team.threadVar] || (team.legacyThreadVar && vars[team.legacyThreadVar]) || null;
 }
 
 async function setThreadTs(team, ts) {
   if (!hasRailwayCreds()) return;
   const { projectId, environmentId, serviceId } = railwayIds();
-  const res = await fetch('https://backboard.railway.app/graphql/v2', {
-    method: 'POST',
-    headers: railwayHeaders(),
-    body: JSON.stringify({
-      query: `
+  await railwayGraphql(`variableUpsert ${team.threadVar}(${team.label})`, `
         mutation VariableUpsert($input: VariableUpsertInput!) {
           variableUpsert(input: $input)
         }
-      `,
-      variables: {
-        input: { projectId, environmentId, serviceId, name: team.threadVar, value: ts },
-      },
-    }),
-  });
-  const json = await res.json();
-  if (json.errors) throw new Error(json.errors[0].message);
+      `, { input: { projectId, environmentId, serviceId, name: team.threadVar, value: ts } });
+}
+
+// Slack Web API 호출 하나. 실패하면 메서드·채널·thread_ts 와 에러 원문(e.data 전체)을 로그로 남기고
+// 메시지 앞에 [Slack <메서드>] 를 붙여 다시 던진다.
+async function slackCall(method, args) {
+  const [ns, fn] = method.split('.');
+  try {
+    return await app.client[ns][fn](args);
+  } catch (e) {
+    const target = `${method} channel=${args.channel || '-'} ts=${args.ts || '-'} thread_ts=${args.thread_ts || '-'}`;
+    console.error(`[외부호출 실패][Slack ${method}] 대상=${target} code=${e.code || '-'}\n에러 원문: ${JSON.stringify(e.data || {}, null, 2)}\n`, e);
+    const err = new Error(`[Slack ${method}] ${e.data?.error || e.message}`);
+    err.data = e.data;
+    throw err;
+  }
 }
 
 // ─── Google Sheets CSV ────────────────────────────────
@@ -876,13 +905,13 @@ async function updateWeeklyThread(team) {
     monday.setDate(d.getDate() - (dow === 0 ? 6 : dow - 1));
     const mondayStr = monday.toLocaleDateString('sv-SE');
     const weekLabel = getWeekLabel(mondayStr);
-    await app.client.chat.update({
+    await slackCall('chat.update', {
       channel: team.channel,
       ts,
       text: `📅 *${weekLabel} 당번 일정*\n\n${weeklyMessage(team, mondayStr)}`,
     });
   } catch (e) {
-    console.error(`[${team.label}] 주간 스레드 업데이트 실패:`, e.message);
+    console.error(`[${team.label}] 주간 스레드 업데이트 실패: ${e.message}\n`, e.stack);
   }
 }
 
@@ -906,7 +935,7 @@ async function postWeeklyReply(team, { text, blocks }) {
   const weeklyTs = await ensureWeeklyThread(team);
   const payload = { channel: team.channel, thread_ts: weeklyTs, text };
   if (blocks) payload.blocks = blocks;
-  const res = await app.client.chat.postMessage(payload);
+  const res = await slackCall('chat.postMessage', payload);
   console.log(`[주간스레드][${team.label}] 답글 게시 thread_ts=${weeklyTs} ts=${res.ts}`);
   return { weeklyTs, ts: res.ts };
 }
@@ -1234,7 +1263,7 @@ async function forEachOperatingTeam(jobName, fn) {
     try {
       await fn(team);
     } catch (e) {
-      console.error(`[${jobName}][${team.label}] 실패:`, e.data?.error || e.message);
+      console.error(`[${jobName}][${team.label}] 실패: ${e.message}\n`, e.stack);
     }
   }
 }
@@ -1258,7 +1287,7 @@ cron.schedule(CONFIG.weeklyTime, () => forEachOperatingTeam('주간스레드', a
 cron.schedule(CONFIG.notifyTime, () => forEachOperatingTeam('오늘알림', async (team) => {
   const today = todayStr();
   const ts = await ensureWeeklyThread(team);
-  await app.client.chat.postMessage({
+  await slackCall('chat.postMessage', {
     channel: team.channel,
     thread_ts: ts,
     text: dutyMessage(team, today, true),
@@ -1271,7 +1300,7 @@ cron.schedule(CONFIG.eveningNotifyTime, () => forEachOperatingTeam('내일예고
   tomorrow.setDate(tomorrow.getDate() + 1);
   const tomorrowStr = tomorrow.toLocaleDateString('sv-SE', { timeZone: 'Asia/Seoul' });
   const ts = await ensureWeeklyThread(team);
-  await app.client.chat.postMessage({
+  await slackCall('chat.postMessage', {
     channel: team.channel,
     thread_ts: ts,
     text: eveningMessage(team, tomorrowStr, true),
@@ -1540,6 +1569,18 @@ if (require.main === module) {
     const authResult = await app.client.auth.test();
     botUserId = authResult.user_id;
     console.log('⚡ 당번 봇이 실행 중입니다! Bot ID:', botUserId);
+    // 알림은 매번 Railway 에서 스레드 ts 를 읽으므로, 시작할 때 한 번 미리 점검해 로그로 남긴다
+    if (!hasRailwayCreds()) {
+      console.warn('[시작][Railway 점검] RAILWAY_API_TOKEN/PROJECT/ENVIRONMENT/SERVICE_ID 중 비어 있는 값이 있어요 — 스레드 ts 를 못 읽어요');
+    }
+    for (const team of TEAMS) {
+      try {
+        const ts = await getThreadTs(team);
+        console.log(`[시작][Railway 점검][${team.label}] ${team.threadVar}=${ts || '(없음)'}`);
+      } catch (e) {
+        console.error(`[시작][Railway 점검][${team.label}] 실패: ${e.message}`);
+      }
+    }
   })();
 }
 
